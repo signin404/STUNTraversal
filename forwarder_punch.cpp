@@ -52,7 +52,19 @@ Config ReadIniConfig(const std::string& filePath) {
     return config;
 }
 
-// --- STUN 客户端 ---
+// --- FIX: CRC32 implementation for STUN FINGERPRINT ---
+uint32_t crc32(const char* data, size_t length) {
+    uint32_t crc = 0xFFFFFFFF;
+    for (size_t i = 0; i < length; ++i) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; ++j) {
+            crc = (crc & 1) ? (crc >> 1) ^ 0xEDB88320 : (crc >> 1);
+        }
+    }
+    return crc ^ 0xFFFFFFFF;
+}
+
+// --- STUN 客户端 (已升级) ---
 bool GetPublicEndpoint(const Config& config, std::string& out_ip, int& out_port) {
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     
@@ -62,17 +74,27 @@ bool GetPublicEndpoint(const Config& config, std::string& out_ip, int& out_port)
     sockaddr_in stun_addr = *(sockaddr_in*)stun_res->ai_addr;
     freeaddrinfo(stun_res);
 
-    char req[20] = { 0 };
-    *(unsigned short*)req = htons(0x0001);
-    *(unsigned short*)(req + 2) = 0;
-    *(unsigned int*)(req + 4) = htonl(0x2112A442);
+    // --- FIX: Build a full 28-byte request with FINGERPRINT ---
+    char req[28] = { 0 };
+    // Header (20 bytes)
+    *(unsigned short*)req = htons(0x0001); // Message Type: Binding Request
+    *(unsigned short*)(req + 2) = htons(8); // Message Length: 8 bytes for FINGERPRINT attribute
+    *(unsigned int*)(req + 4) = htonl(0x2112A442); // Magic Cookie
 
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<unsigned int> dis;
     for (int i = 0; i < 3; ++i) {
-        *(unsigned int*)(req + 8 + i * 4) = dis(gen);
+        *(unsigned int*)(req + 8 + i * 4) = dis(gen); // Transaction ID
     }
+
+    // FINGERPRINT Attribute (8 bytes)
+    *(unsigned short*)(req + 20) = htons(0x8028); // Attribute Type: FINGERPRINT
+    *(unsigned short*)(req + 22) = htons(4);      // Attribute Length: 4 bytes
+    
+    // Calculate CRC32 over the first 24 bytes (header + attribute header)
+    uint32_t crc = crc32(req, 24);
+    *(unsigned int*)(req + 24) = htonl(crc ^ 0x5354554e); // XOR with magic number
 
     sendto(sock, req, sizeof(req), 0, (const sockaddr*)&stun_addr, sizeof(stun_addr));
 
@@ -109,7 +131,7 @@ bool GetPublicEndpoint(const Config& config, std::string& out_ip, int& out_port)
 // --- TCP 代理和心跳 ---
 void TcpProxy(SOCKET s1, SOCKET s2, int keep_alive_ms) {
     tcp_keepalive ka;
-    ka.onoff = (u_long)1; // FIX: Explicit cast to u_long to silence warning
+    ka.onoff = (u_long)1;
     ka.keepalivetime = keep_alive_ms;
     ka.keepaliveinterval = 1000;
     DWORD bytes_returned;
@@ -131,7 +153,6 @@ void TcpHolePunchingThread(Config config, bool is_listener, const std::string& p
         SetColor(WHITE);
         std::cout << "\n--- 开始新一轮穿透尝试 ---" << std::endl;
 
-        // 1. 获取公网地址
         SetColor(CYAN);
         std::cout << "[步骤 1] 正在通过 STUN 服务器发现公网地址..." << std::endl;
         std::string my_public_ip;
@@ -149,7 +170,6 @@ void TcpHolePunchingThread(Config config, bool is_listener, const std::string& p
             goto retry_logic;
         }
 
-        // 2. 创建并绑定本地TCP套接字
         SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         BOOL reuse = TRUE;
         setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
@@ -160,12 +180,11 @@ void TcpHolePunchingThread(Config config, bool is_listener, const std::string& p
             std::cerr << "[错误] 无法绑定本地端口 " << config.tcp_local_listen_port << "。该端口可能已被占用。" << std::endl;
             closesocket(sock);
             goto retry_logic;
-        } // <<< FIX: Added the missing closing brace here
+        }
 
         SetColor(CYAN);
         std::cout << "[步骤 2] 套接字已成功绑定至本地端口 " << config.tcp_local_listen_port << "。" << std::endl;
 
-        // 3. "预热" NAT
         SetColor(CYAN);
         std::cout << "[步骤 3] 正在通过连接 '" << config.tcp_priming_host << "' 来预热 NAT..." << std::endl;
         addrinfo* prime_res = nullptr;
@@ -180,7 +199,6 @@ void TcpHolePunchingThread(Config config, bool is_listener, const std::string& p
         SetColor(GREEN);
         std::cout << "[成功] NAT 预热包已发送。" << std::endl;
 
-        // 4. 打洞
         SOCKET peer_sock = INVALID_SOCKET;
         if (is_listener) {
             SetColor(CYAN);
@@ -219,7 +237,6 @@ void TcpHolePunchingThread(Config config, bool is_listener, const std::string& p
             ioctlsocket(sock, FIONBIO, &mode);
         }
 
-        // 5. 结果处理和转发
         if (peer_sock != INVALID_SOCKET) {
             SetColor(LIGHT_GREEN);
             std::cout << "\n[穿透成功] TCP 打洞成功！P2P 直连已建立。" << std::endl;
