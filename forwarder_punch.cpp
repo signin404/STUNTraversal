@@ -63,7 +63,7 @@ bool RecvAll(SOCKET sock, char* buffer, int len) {
     return true;
 }
 
-// --- STUN 客户端 (STUN over TCP 模式) ---
+// --- STUN 客户端 (已修复 inet_ntoa 内存损坏问题) ---
 bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_port) {
     SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     
@@ -133,12 +133,24 @@ bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_p
             port ^= (ntohl(0x2112A442) >> 16);
             ip ^= ntohl(0x2112A442);
             
-            in_addr addr = { htonl(ip) };
-            out_ip = inet_ntoa(addr);
-            out_port = port;
-            return true;
+            in_addr addr;
+            addr.s_addr = htonl(ip);
+            
+            // --- FIX: Use the modern, safe inet_ntop instead of the deprecated inet_ntoa ---
+            char ip_str[INET_ADDRSTRLEN];
+            if (inet_ntop(AF_INET, &addr, ip_str, INET_ADDRSTRLEN) != NULL) {
+                out_ip = ip_str;
+                out_port = port;
+                return true;
+            } else {
+                return false; // Conversion failed
+            }
         }
-        p += (4 + (len % 4 == 0 ? len : len + (4 - len % 4)));
+        // Correctly handle padding
+        p += 4 + len;
+        if (len % 4 != 0) {
+            p += (4 - (len % 4));
+        }
     }
     return false;
 }
@@ -162,7 +174,7 @@ void TcpProxy(SOCKET s1, SOCKET s2, int keep_alive_ms) {
     closesocket(s2);
 }
 
-// --- TCP 打洞主逻辑 (已重构，使用双套接字模型) ---
+// --- TCP 打洞主逻辑 ---
 void TcpHolePunchingThread(Config config, bool is_listener, const std::string& peer_addr_str) {
     do {
         SetColor(WHITE);
@@ -192,7 +204,6 @@ void TcpHolePunchingThread(Config config, bool is_listener, const std::string& p
             std::cout << "[操作] 请将此地址发送给连接方。" << std::endl;
         }
 
-        // --- FIX: Create the main socket for listening or connecting ---
         SOCKET main_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         BOOL reuse = TRUE;
         setsockopt(main_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
@@ -202,7 +213,6 @@ void TcpHolePunchingThread(Config config, bool is_listener, const std::string& p
             SetColor(RED);
             std::cerr << "[错误] 无法绑定本地端口 " << config.tcp_local_listen_port << "。该端口可能已被占用。" << std::endl;
             closesocket(main_sock);
-            // ... (retry logic)
             if (config.tcp_auto_retry) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(config.tcp_retry_interval_ms));
                 continue;
@@ -214,27 +224,24 @@ void TcpHolePunchingThread(Config config, bool is_listener, const std::string& p
         SetColor(CYAN);
         std::cout << "[步骤 2] 主套接字已成功绑定至本地端口 " << config.tcp_local_listen_port << "。" << std::endl;
 
-        // If listener, put the main socket into listening state BEFORE priming
         if (is_listener) {
             listen(main_sock, 1);
         }
 
-        // --- FIX: Use a separate, temporary socket for priming the NAT ---
         SetColor(CYAN);
         std::cout << "[步骤 3] 正在通过连接 '" << config.tcp_priming_host << "' 来预热 NAT..." << std::endl;
         SOCKET prime_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         setsockopt(prime_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
-        bind(prime_sock, (sockaddr*)&local_addr, sizeof(local_addr)); // Bind to the same local port
+        bind(prime_sock, (sockaddr*)&local_addr, sizeof(local_addr));
 
         addrinfo* prime_res = nullptr;
         getaddrinfo(config.tcp_priming_host.c_str(), "80", nullptr, &prime_res);
-        // We don't care if this connect succeeds, just send the SYN packet
         u_long mode = 1;
         ioctlsocket(prime_sock, FIONBIO, &mode);
         connect(prime_sock, prime_res->ai_addr, (int)prime_res->ai_addrlen);
         freeaddrinfo(prime_res);
-        std::this_thread::sleep_for(std::chrono::milliseconds(200)); // Give it time to send
-        closesocket(prime_sock); // The priming socket's job is done
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        closesocket(prime_sock);
         SetColor(GREEN);
         std::cout << "[成功] NAT 预热包已发送。" << std::endl;
 
@@ -250,7 +257,7 @@ void TcpHolePunchingThread(Config config, bool is_listener, const std::string& p
             if (select(0, &read_set, NULL, NULL, &timeout) > 0) {
                 peer_sock = accept(main_sock, NULL, NULL);
             }
-        } else { // Connector
+        } else {
             SetColor(CYAN);
             std::cout << "[步骤 4] 正在连接对端地址 " << peer_addr_str << "..." << std::endl;
             size_t colon_pos = peer_addr_str.find(':');
@@ -291,7 +298,7 @@ void TcpHolePunchingThread(Config config, bool is_listener, const std::string& p
             SetColor(RED);
             std::cerr << "[穿透失败] TCP 打洞失败 (连接超时)。" << std::endl;
         }
-        closesocket(main_sock); // Close the main socket at the end of the attempt
+        closesocket(main_sock);
 
         if (config.tcp_auto_retry) {
             SetColor(YELLOW);
@@ -339,4 +346,4 @@ int main(int argc, char* argv[]) {
 
     WSACleanup();
     return 0;
-}
+}```
