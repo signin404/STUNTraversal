@@ -25,7 +25,7 @@ struct Config {
     int local_punch_port;
     std::string forward_host;
     int forward_port;
-    std::string priming_host; // 现在应该是一个高可用的服务器，如 qq.com
+    std::string priming_host;
     int keep_alive_ms;
     int retry_interval_ms;
     bool auto_retry;
@@ -123,7 +123,7 @@ void TcpProxy(SOCKET s1, SOCKET s2, int keep_alive_ms) {
     closesocket(s1); closesocket(s2);
 }
 
-// --- 连接处理 (无需修改) ---
+// --- 连接处理 (已修复) ---
 void HandleNewConnection(SOCKET peer_sock, Config config) {
     sockaddr_in peer_addr; int peer_addr_len = sizeof(peer_addr);
     getpeername(peer_sock, (sockaddr*)&peer_addr, &peer_addr_len);
@@ -140,14 +140,15 @@ void HandleNewConnection(SOCKET peer_sock, Config config) {
         closesocket(peer_sock);
     } else {
         SetColor(YELLOW);
-        std::cout << "[转发] 开始转发 " << peer_ip_str << " <==> " << config.forward_host << ":" << config.port << std::endl;
+        // *** FIX: Corrected config.port to config.forward_port ***
+        std::cout << "[转发] 开始转发 " << peer_ip_str << " <==> " << config.forward_host << ":" << config.forward_port << std::endl;
         std::thread(TcpProxy, peer_sock, target_sock, config.keep_alive_ms).detach();
         std::thread(TcpProxy, target_sock, peer_sock, config.keep_alive_ms).detach();
     }
     freeaddrinfo(fwd_res);
 }
 
-// --- 单边打洞并监听的主逻辑 (最终修复版) ---
+// --- 单边打洞并监听的主逻辑 (无需修改) ---
 void PortForwardingThread(Config config) {
     do {
         SetColor(WHITE);
@@ -163,7 +164,6 @@ void PortForwardingThread(Config config) {
         SetColor(LIGHT_GREEN);
         std::cout << "[成功] 当前公网端口为: " << public_ip << ":" << public_port << std::endl;
 
-        // 步骤 2: 创建并设置两个套接字
         SOCKET listener_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         SOCKET heartbeat_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         
@@ -173,7 +173,6 @@ void PortForwardingThread(Config config) {
 
         sockaddr_in local_addr = { AF_INET, htons(config.local_punch_port), {INADDR_ANY} };
 
-        // 步骤 3: 绑定两个套接字到同一本地端口
         if (bind(listener_sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR ||
             bind(heartbeat_sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR) {
             SetColor(RED); std::cerr << "[错误] 无法绑定本地端口 " << config.local_punch_port << "。错误码: " << WSAGetLastError() << std::endl;
@@ -183,14 +182,12 @@ void PortForwardingThread(Config config) {
         SetColor(CYAN);
         std::cout << "[步骤 2] 两个套接字已成功绑定至本地端口 " << config.local_punch_port << "。" << std::endl;
 
-        // 步骤 4: 监听套接字进入监听状态
         if (listen(listener_sock, SOMAXCONN) == SOCKET_ERROR) {
             SetColor(RED); std::cerr << "[错误] 监听套接字 listen() 失败。" << std::endl;
             closesocket(listener_sock); closesocket(heartbeat_sock);
             if (config.auto_retry) { std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms)); continue; } else break;
         }
 
-        // 步骤 5: 心跳套接字连接公网服务器以“撑开”NAT映射
         SetColor(CYAN);
         std::cout << "[步骤 3] 正在连接 '" << config.priming_host << "' 以建立并保持NAT映射..." << std::endl;
         addrinfo* prime_res = nullptr;
@@ -204,7 +201,6 @@ void PortForwardingThread(Config config) {
             }
             freeaddrinfo(prime_res);
             
-            // 设置TCP Keep-Alive以确保连接不被空闲断开
             tcp_keepalive ka; ka.onoff = (u_long)1; ka.keepalivetime = config.keep_alive_ms; ka.keepaliveinterval = 1000;
             DWORD bytes_returned;
             WSAIoctl(heartbeat_sock, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), NULL, 0, &bytes_returned, NULL, NULL);
@@ -214,7 +210,6 @@ void PortForwardingThread(Config config) {
             SetColor(YELLOW);
             std::cout << "[服务] 所有传入连接将被转发到 " << config.forward_host << ":" << config.forward_port << std::endl;
 
-            // 步骤 6: 在监听套接字上循环接受连接
             while (true) {
                 SOCKET peer_sock = accept(listener_sock, NULL, NULL);
                 if (peer_sock == INVALID_SOCKET) {
