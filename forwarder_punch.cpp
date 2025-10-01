@@ -62,12 +62,10 @@ bool GetPublicEndpoint_Legacy(const Config& config, std::string& out_ip, int& ou
     sockaddr_in stun_addr = *(sockaddr_in*)stun_res->ai_addr;
     freeaddrinfo(stun_res);
 
-    // --- FIX: Build a simple 20-byte RFC 3489 request ---
     char req[20] = { 0 };
-    *(unsigned short*)req = htons(0x0001); // Message Type: Binding Request
-    *(unsigned short*)(req + 2) = 0;       // Message Length: 0 (no attributes)
+    *(unsigned short*)req = htons(0x0001);
+    *(unsigned short*)(req + 2) = 0;
 
-    // Transaction ID (16 bytes for legacy STUN)
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<unsigned int> dis;
@@ -86,19 +84,16 @@ bool GetPublicEndpoint_Legacy(const Config& config, std::string& out_ip, int& ou
 
     if (bytes <= 0) return false;
 
-    // Check for legacy response type
     if (!((buffer[0] == 0x01) && (buffer[1] == 0x01))) return false;
     
     const char* p = buffer + 20;
     while (p < buffer + bytes) {
         unsigned short type = ntohs(*(unsigned short*)p);
         unsigned short len = ntohs(*(unsigned short*)(p + 2));
-        // Look for MAPPED-ADDRESS (0x0001)
         if (type == 0x0001) {
             unsigned short port = ntohs(*(unsigned short*)(p + 6));
-            
             in_addr addr;
-            addr.s_addr = *(unsigned int*)(p + 8); // IP is in network byte order
+            addr.s_addr = *(unsigned int*)(p + 8);
             out_ip = inet_ntoa(addr);
             out_port = port;
             return true;
@@ -127,7 +122,7 @@ void TcpProxy(SOCKET s1, SOCKET s2, int keep_alive_ms) {
     closesocket(s2);
 }
 
-// --- TCP 打洞主逻辑 ---
+// --- TCP 打洞主逻辑 (已重构，移除 GOTO) ---
 void TcpHolePunchingThread(Config config, bool is_listener, const std::string& peer_addr_str) {
     do {
         SetColor(WHITE);
@@ -137,17 +132,24 @@ void TcpHolePunchingThread(Config config, bool is_listener, const std::string& p
         std::cout << "[步骤 1] 正在通过 STUN 服务器发现公网地址 (兼容模式)..." << std::endl;
         std::string my_public_ip;
         int my_public_port;
-        if (GetPublicEndpoint_Legacy(config, my_public_ip, my_public_port)) {
-            SetColor(LIGHT_GREEN);
-            std::cout << "[成功] 我的公网地址是: " << my_public_ip << ":" << my_public_port << std::endl;
-            if (is_listener) {
-                SetColor(YELLOW);
-                std::cout << "[操作] 请将此地址发送给连接方。" << std::endl;
-            }
-        } else {
+        if (!GetPublicEndpoint_Legacy(config, my_public_ip, my_public_port)) {
             SetColor(RED);
             std::cerr << "[失败] STUN 请求超时或失败。请检查服务器地址或网络连接。" << std::endl;
-            goto retry_logic;
+            if (config.tcp_auto_retry) {
+                SetColor(YELLOW);
+                std::cout << "[准备重试] 等待 " << config.tcp_retry_interval_ms << " 毫秒后将自动重试..." << std::endl;
+                std::this_thread::sleep_for(std::chrono::milliseconds(config.tcp_retry_interval_ms));
+                continue; // 跳至下一次循环
+            } else {
+                break; // 退出循环
+            }
+        }
+        
+        SetColor(LIGHT_GREEN);
+        std::cout << "[成功] 我的公网地址是: " << my_public_ip << ":" << my_public_port << std::endl;
+        if (is_listener) {
+            SetColor(YELLOW);
+            std::cout << "[操作] 请将此地址发送给连接方。" << std::endl;
         }
 
         SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -159,7 +161,14 @@ void TcpHolePunchingThread(Config config, bool is_listener, const std::string& p
             SetColor(RED);
             std::cerr << "[错误] 无法绑定本地端口 " << config.tcp_local_listen_port << "。该端口可能已被占用。" << std::endl;
             closesocket(sock);
-            goto retry_logic;
+            if (config.tcp_auto_retry) {
+                SetColor(YELLOW);
+                std::cout << "[准备重试] 等待 " << config.tcp_retry_interval_ms << " 毫秒后将自动重试..." << std::endl;
+                std::this_thread::sleep_for(std::chrono::milliseconds(config.tcp_retry_interval_ms));
+                continue;
+            } else {
+                break;
+            }
         }
 
         SetColor(CYAN);
@@ -243,7 +252,6 @@ void TcpHolePunchingThread(Config config, bool is_listener, const std::string& p
             closesocket(sock);
         }
 
-    retry_logic:
         if (config.tcp_auto_retry) {
             SetColor(YELLOW);
             std::cout << "[准备重试] 等待 " << config.tcp_retry_interval_ms << " 毫秒后将自动重试..." << std::endl;
@@ -264,4 +272,30 @@ int main(int argc, char* argv[]) {
         std::cout << "用法说明:\n";
         std::cout << "  作为监听方:  forwarder.exe listen\n";
         std::cout << "  作为连接方:  forwarder.exe connect <监听方的公网IP:端口>\n";
-        WSACL
+        WSACleanup(); // FIX: Corrected typo
+        return 1;
+    }
+
+    bool is_listener = (strcmp(argv[1], "listen") == 0);
+    std::string peer_addr_str = "";
+    if (!is_listener) {
+        if (argc < 3) {
+            SetColor(RED);
+            std::cerr << "错误: 连接方模式需要提供对端的公网地址。" << std::endl;
+            return 1;
+        }
+        peer_addr_str = argv[2];
+    }
+
+    char exePath[MAX_PATH];
+    GetModuleFileNameA(NULL, exePath, MAX_PATH);
+    PathRemoveFileSpecA(exePath);
+    std::string iniPath = std::string(exePath) + "\\config.ini";
+    
+    Config config = ReadIniConfig(iniPath);
+
+    TcpHolePunchingThread(config, is_listener, peer_addr_str);
+
+    WSACleanup(); // FIX: Corrected typo
+    return 0;
+} // FIX: Added missing closing brace for main function
