@@ -93,7 +93,7 @@ bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_p
 
     // Transaction ID
     std::random_device rd;
-    std::mt1937 gen(rd());
+    std::mt19937 gen(rd()); // <--- FIX: Corrected typo from mt1937 to mt19937
     std::uniform_int_distribution<unsigned int> dis;
     for (int i = 0; i < 3; ++i) {
         *(unsigned int*)(req + 8 + i * 4) = dis(gen);
