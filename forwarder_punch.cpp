@@ -52,7 +52,7 @@ Config ReadIniConfig(const std::string& filePath) {
     return config;
 }
 
-// --- STUN 客户端 (古老 RFC 3489 模式) ---
+// --- STUN 客户端 (古老 RFC 3489 模式 + CHANGE-REQUEST) ---
 bool GetPublicEndpoint_Legacy(const Config& config, std::string& out_ip, int& out_port) {
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     
@@ -62,16 +62,23 @@ bool GetPublicEndpoint_Legacy(const Config& config, std::string& out_ip, int& ou
     sockaddr_in stun_addr = *(sockaddr_in*)stun_res->ai_addr;
     freeaddrinfo(stun_res);
 
-    char req[20] = { 0 };
-    *(unsigned short*)req = htons(0x0001);
-    *(unsigned short*)(req + 2) = 0;
+    // --- FIX: Build a 28-byte request including the CHANGE-REQUEST attribute ---
+    char req[28] = { 0 };
+    // Header (20 bytes)
+    *(unsigned short*)req = htons(0x0001); // Message Type: Binding Request
+    *(unsigned short*)(req + 2) = htons(8); // Message Length: 8 bytes for one attribute
 
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<unsigned int> dis;
     for (int i = 0; i < 4; ++i) {
-        *(unsigned int*)(req + 4 + i * 4) = dis(gen);
+        *(unsigned int*)(req + 4 + i * 4) = dis(gen); // 16-byte Transaction ID
     }
+
+    // Attribute (8 bytes)
+    *(unsigned short*)(req + 20) = htons(0x0003); // Attribute Type: CHANGE-REQUEST
+    *(unsigned short*)(req + 22) = htons(4);      // Attribute Length: 4 bytes
+    *(unsigned int*)(req + 24) = 0;               // Value: 0 (no change requested)
 
     sendto(sock, req, sizeof(req), 0, (const sockaddr*)&stun_addr, sizeof(stun_addr));
 
@@ -90,7 +97,7 @@ bool GetPublicEndpoint_Legacy(const Config& config, std::string& out_ip, int& ou
     while (p < buffer + bytes) {
         unsigned short type = ntohs(*(unsigned short*)p);
         unsigned short len = ntohs(*(unsigned short*)(p + 2));
-        if (type == 0x0001) {
+        if (type == 0x0001) { // MAPPED-ADDRESS
             unsigned short port = ntohs(*(unsigned short*)(p + 6));
             in_addr addr;
             addr.s_addr = *(unsigned int*)(p + 8);
@@ -122,7 +129,7 @@ void TcpProxy(SOCKET s1, SOCKET s2, int keep_alive_ms) {
     closesocket(s2);
 }
 
-// --- TCP 打洞主逻辑 (已重构，移除 GOTO) ---
+// --- TCP 打洞主逻辑 ---
 void TcpHolePunchingThread(Config config, bool is_listener, const std::string& peer_addr_str) {
     do {
         SetColor(WHITE);
@@ -139,9 +146,9 @@ void TcpHolePunchingThread(Config config, bool is_listener, const std::string& p
                 SetColor(YELLOW);
                 std::cout << "[准备重试] 等待 " << config.tcp_retry_interval_ms << " 毫秒后将自动重试..." << std::endl;
                 std::this_thread::sleep_for(std::chrono::milliseconds(config.tcp_retry_interval_ms));
-                continue; // 跳至下一次循环
+                continue;
             } else {
-                break; // 退出循环
+                break;
             }
         }
         
@@ -272,7 +279,7 @@ int main(int argc, char* argv[]) {
         std::cout << "用法说明:\n";
         std::cout << "  作为监听方:  forwarder.exe listen\n";
         std::cout << "  作为连接方:  forwarder.exe connect <监听方的公网IP:端口>\n";
-        WSACleanup(); // FIX: Corrected typo
+        WSACleanup();
         return 1;
     }
 
@@ -296,6 +303,6 @@ int main(int argc, char* argv[]) {
 
     TcpHolePunchingThread(config, is_listener, peer_addr_str);
 
-    WSACleanup(); // FIX: Corrected typo
+    WSACleanup();
     return 0;
-} // FIX: Added missing closing brace for main function
+}
