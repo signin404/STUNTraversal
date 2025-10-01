@@ -25,7 +25,6 @@ struct Config {
     int local_punch_port;
     std::string forward_host;
     int forward_port;
-    std::string priming_host;
     int keep_alive_ms;
     int retry_interval_ms;
     bool auto_retry;
@@ -42,8 +41,6 @@ Config ReadIniConfig(const std::string& filePath) {
     GetPrivateProfileStringA("TCP_HolePunch", "ForwardHost", "127.0.0.1", buffer, sizeof(buffer), filePath.c_str());
     config.forward_host = buffer;
     config.forward_port = GetPrivateProfileIntA("TCP_HolePunch", "ForwardPort", 9999, filePath.c_str());
-    GetPrivateProfileStringA("TCP_HolePunch", "PrimingHost", "qq.com", buffer, sizeof(buffer), filePath.c_str());
-    config.priming_host = buffer;
     config.keep_alive_ms = GetPrivateProfileIntA("TCP_HolePunch", "KeepAliveMS", 2300, filePath.c_str());
     config.retry_interval_ms = GetPrivateProfileIntA("TCP_HolePunch", "RetryIntervalMS", 30000, filePath.c_str());
     config.auto_retry = GetPrivateProfileIntA("TCP_HolePunch", "AutoRetry", 1, filePath.c_str()) == 1;
@@ -61,54 +58,6 @@ bool RecvAll(SOCKET sock, char* buffer, int len) {
     return true;
 }
 
-// --- STUN 客户端 (无需修改) ---
-bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_port) {
-    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock == INVALID_SOCKET) return false;
-    addrinfo* stun_res = nullptr;
-    if (getaddrinfo(config.stun_server_host.c_str(), std::to_string(config.stun_server_port).c_str(), nullptr, &stun_res) != 0 || !stun_res) {
-        closesocket(sock); return false;
-    }
-    DWORD timeout_ms = 3000;
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms));
-    if (connect(sock, stun_res->ai_addr, (int)stun_res->ai_addrlen) == SOCKET_ERROR) {
-        freeaddrinfo(stun_res); closesocket(sock); return false;
-    }
-    freeaddrinfo(stun_res);
-    char req[20] = { 0 };
-    *(unsigned short*)req = htons(0x0001); *(unsigned short*)(req + 2) = 0; *(unsigned int*)(req + 4) = htonl(0x2112A442);
-    std::random_device rd; std::mt19937 gen(rd()); std::uniform_int_distribution<unsigned int> dis;
-    for (int i = 0; i < 3; ++i) { *(unsigned int*)(req + 8 + i * 4) = dis(gen); }
-    if (send(sock, req, sizeof(req), 0) == SOCKET_ERROR) { closesocket(sock); return false; }
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms));
-    char header_buffer[20];
-    if (!RecvAll(sock, header_buffer, 20)) { closesocket(sock); return false; }
-    if (!((header_buffer[0] == 0x01) && (header_buffer[1] == 0x01))) { closesocket(sock); return false; }
-    unsigned short msg_len = ntohs(*(unsigned short*)(header_buffer + 2));
-    if (msg_len > 1400) { closesocket(sock); return false; }
-    std::vector<char> attr_buffer(msg_len);
-    if (msg_len > 0 && !RecvAll(sock, attr_buffer.data(), msg_len)) { closesocket(sock); return false; }
-    closesocket(sock);
-    const char* p = attr_buffer.data(); const char* end = p + msg_len;
-    while (p < end) {
-        unsigned short type = ntohs(*(unsigned short*)p); unsigned short len = ntohs(*(unsigned short*)(p + 2));
-        const char* attr_value = p + 4;
-        if (type == 0x0020) {
-            unsigned short port_net = *(unsigned short*)(attr_value + 2); unsigned int ip_net = *(unsigned int*)(attr_value + 4);
-            unsigned int magic_cookie_net = htonl(0x2112A442);
-            unsigned short real_port_net = port_net ^ htons(0x2112); unsigned int real_ip_net = ip_net ^ magic_cookie_net;
-            out_port = ntohs(real_port_net);
-            in_addr addr; addr.s_addr = real_ip_net;
-            char ip_str[INET_ADDRSTRLEN];
-            if (inet_ntop(AF_INET, &addr, ip_str, INET_ADDRSTRLEN) != NULL) {
-                out_ip = ip_str; return true;
-            } else { return false; }
-        }
-        p += 4 + len; if (len % 4 != 0) p += (4 - (len % 4));
-    }
-    return false;
-}
-
 // --- TCP 代理 (无需修改) ---
 void TcpProxy(SOCKET s1, SOCKET s2, int keep_alive_ms) {
     tcp_keepalive ka; ka.onoff = (u_long)1; ka.keepalivetime = keep_alive_ms; ka.keepaliveinterval = 1000;
@@ -123,14 +72,14 @@ void TcpProxy(SOCKET s1, SOCKET s2, int keep_alive_ms) {
     closesocket(s1); closesocket(s2);
 }
 
-// --- 连接处理 (已修复) ---
+// --- 连接处理 (无需修改) ---
 void HandleNewConnection(SOCKET peer_sock, Config config) {
     sockaddr_in peer_addr; int peer_addr_len = sizeof(peer_addr);
     getpeername(peer_sock, (sockaddr*)&peer_addr, &peer_addr_len);
     char peer_ip_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &peer_addr.sin_addr, peer_ip_str, sizeof(peer_ip_str));
     SetColor(GREEN);
-    std::cout << "[新连接] 接受来自 " << peer_ip_str << ":" << ntohs(peer_addr.sin_port) << " 的连接。" << std::endl;
+    std::cout << "[新连接] 接受来自 " << peer_ip_str << ":" << ntohs(peer_addr.sin_port) << " 的连接。" << std.endl;
     SOCKET target_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     addrinfo* fwd_res = nullptr;
     getaddrinfo(config.forward_host.c_str(), std::to_string(config.forward_port).c_str(), nullptr, &fwd_res);
@@ -140,7 +89,6 @@ void HandleNewConnection(SOCKET peer_sock, Config config) {
         closesocket(peer_sock);
     } else {
         SetColor(YELLOW);
-        // *** FIX: Corrected config.port to config.forward_port ***
         std::cout << "[转发] 开始转发 " << peer_ip_str << " <==> " << config.forward_host << ":" << config.forward_port << std::endl;
         std::thread(TcpProxy, peer_sock, target_sock, config.keep_alive_ms).detach();
         std::thread(TcpProxy, target_sock, peer_sock, config.keep_alive_ms).detach();
@@ -148,81 +96,124 @@ void HandleNewConnection(SOCKET peer_sock, Config config) {
     freeaddrinfo(fwd_res);
 }
 
-// --- 单边打洞并监听的主逻辑 (无需修改) ---
+// --- 单边打洞并监听的主逻辑 (最终版) ---
 void PortForwardingThread(Config config) {
     do {
         SetColor(WHITE);
         std::cout << "\n--- 开始新一轮端口开启尝试 ---" << std::endl;
 
-        std::string public_ip; int public_port;
-        SetColor(CYAN);
-        std::cout << "[步骤 1] 正在通过 STUN/TCP 发现公网地址..." << std::endl;
-        if (!GetPublicEndpoint_TCP(config, public_ip, public_port)) {
-            SetColor(RED); std::cerr << "[失败] STUN 请求失败。" << std::endl;
-            if (config.auto_retry) { std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms)); continue; } else break;
-        }
-        SetColor(LIGHT_GREEN);
-        std::cout << "[成功] 当前公网端口为: " << public_ip << ":" << public_port << std::endl;
-
+        // 步骤 1: 创建监听和心跳套接字
         SOCKET listener_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        SOCKET heartbeat_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        SOCKET stun_heartbeat_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         
         BOOL reuse = TRUE;
         setsockopt(listener_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
-        setsockopt(heartbeat_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+        setsockopt(stun_heartbeat_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
 
         sockaddr_in local_addr = { AF_INET, htons(config.local_punch_port), {INADDR_ANY} };
 
+        // 步骤 2: 绑定两个套接字到同一本地端口
         if (bind(listener_sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR ||
-            bind(heartbeat_sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR) {
-            SetColor(RED); std::cerr << "[错误] 无法绑定本地端口 " << config.local_punch_port << "。错误码: " << WSAGetLastError() << std::endl;
-            closesocket(listener_sock); closesocket(heartbeat_sock);
+            bind(stun_heartbeat_sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR) {
+            SetColor(RED); std::cerr << "[错误] 无法绑定本地端口 " << config.local_punch_port << "。" << std::endl;
+            closesocket(listener_sock); closesocket(stun_heartbeat_sock);
             if (config.auto_retry) { std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms)); continue; } else break;
         }
         SetColor(CYAN);
-        std::cout << "[步骤 2] 两个套接字已成功绑定至本地端口 " << config.local_punch_port << "。" << std::endl;
+        std::cout << "[步骤 1] 套接字已成功绑定至本地端口 " << config.local_punch_port << "。" << std::endl;
 
+        // 步骤 3: 监听套接字进入监听状态 (必须在 connect 之前)
         if (listen(listener_sock, SOMAXCONN) == SOCKET_ERROR) {
             SetColor(RED); std::cerr << "[错误] 监听套接字 listen() 失败。" << std::endl;
-            closesocket(listener_sock); closesocket(heartbeat_sock);
+            closesocket(listener_sock); closesocket(stun_heartbeat_sock);
             if (config.auto_retry) { std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms)); continue; } else break;
         }
 
+        // 步骤 4: 使用心跳套接字连接 STUN 服务器
         SetColor(CYAN);
-        std::cout << "[步骤 3] 正在连接 '" << config.priming_host << "' 以建立并保持NAT映射..." << std::endl;
-        addrinfo* prime_res = nullptr;
-        getaddrinfo(config.priming_host.c_str(), "80", nullptr, &prime_res);
-        if (prime_res) {
-            if (connect(heartbeat_sock, prime_res->ai_addr, (int)prime_res->ai_addrlen) == SOCKET_ERROR) {
-                SetColor(RED); std::cerr << "[失败] 无法连接到保持服务器 '" << config.priming_host << "'。" << std::endl;
-                freeaddrinfo(prime_res);
-                closesocket(listener_sock); closesocket(heartbeat_sock);
-                if (config.auto_retry) { std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms)); continue; } else break;
-            }
-            freeaddrinfo(prime_res);
-            
-            tcp_keepalive ka; ka.onoff = (u_long)1; ka.keepalivetime = config.keep_alive_ms; ka.keepaliveinterval = 1000;
-            DWORD bytes_returned;
-            WSAIoctl(heartbeat_sock, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), NULL, 0, &bytes_returned, NULL, NULL);
-
-            SetColor(GREEN);
-            std::cout << "[成功] NAT映射已建立！公网端口 " << public_port << " 已开启并监听。" << std::endl;
-            SetColor(YELLOW);
-            std::cout << "[服务] 所有传入连接将被转发到 " << config.forward_host << ":" << config.forward_port << std::endl;
-
-            while (true) {
-                SOCKET peer_sock = accept(listener_sock, NULL, NULL);
-                if (peer_sock == INVALID_SOCKET) {
-                    SetColor(RED); std::cerr << "[警告] accept() 失败，准备重试..." << std::endl;
-                    break; 
-                }
-                std::thread(HandleNewConnection, peer_sock, config).detach();
-            }
-        } else {
-             SetColor(RED); std::cerr << "[错误] 无法解析保持服务器 '" << config.priming_host << "'。" << std::endl;
+        std::cout << "[步骤 2] 正在连接 STUN 服务器 '" << config.stun_server_host << "' 以发现并保持端口..." << std::endl;
+        addrinfo* stun_res = nullptr;
+        if (getaddrinfo(config.stun_server_host.c_str(), std::to_string(config.stun_server_port).c_str(), nullptr, &stun_res) != 0 || !stun_res) {
+            SetColor(RED); std::cerr << "[错误] 无法解析 STUN 服务器地址。" << std::endl;
+            closesocket(listener_sock); closesocket(stun_heartbeat_sock);
+            if (config.auto_retry) { std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms)); continue; } else break;
         }
+        
+        if (connect(stun_heartbeat_sock, stun_res->ai_addr, (int)stun_res->ai_addrlen) == SOCKET_ERROR) {
+            SetColor(RED); std::cerr << "[失败] 无法连接到 STUN 服务器。" << std::endl;
+            freeaddrinfo(stun_res);
+            closesocket(listener_sock); closesocket(stun_heartbeat_sock);
+            if (config.auto_retry) { std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms)); continue; } else break;
+        }
+        freeaddrinfo(stun_res);
+
+        // 步骤 5: 在已连接的心跳套接字上发送 STUN 请求
+        char req[20] = { 0 };
+        *(unsigned short*)req = htons(0x0001); *(unsigned short*)(req + 2) = 0; *(unsigned int*)(req + 4) = htonl(0x2112A442);
+        std::random_device rd; std::mt19937 gen(rd()); std::uniform_int_distribution<unsigned int> dis;
+        for (int i = 0; i < 3; ++i) { *(unsigned int*)(req + 8 + i * 4) = dis(gen); }
+        if (send(stun_heartbeat_sock, req, sizeof(req), 0) == SOCKET_ERROR) {
+            SetColor(RED); std::cerr << "[失败] 发送 STUN 请求失败。" << std::endl;
+            closesocket(listener_sock); closesocket(stun_heartbeat_sock);
+            if (config.auto_retry) { std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms)); continue; } else break;
+        }
+
+        // 步骤 6: 接收并解析 STUN 响应以获取真实的公网端口
+        std::string public_ip; int public_port; bool stun_success = false;
+        char header_buffer[20];
+        if (RecvAll(stun_heartbeat_sock, header_buffer, 20)) {
+            unsigned short msg_len = ntohs(*(unsigned short*)(header_buffer + 2));
+            if (msg_len <= 1400) {
+                std::vector<char> attr_buffer(msg_len);
+                if (msg_len == 0 || RecvAll(stun_heartbeat_sock, attr_buffer.data(), msg_len)) {
+                    const char* p = attr_buffer.data(); const char* end = p + msg_len;
+                    while (p < end) {
+                        unsigned short type = ntohs(*(unsigned short*)p); unsigned short len = ntohs(*(unsigned short*)(p + 2));
+                        const char* attr_value = p + 4;
+                        if (type == 0x0020) {
+                            unsigned short port_net = *(unsigned short*)(attr_value + 2); unsigned int ip_net = *(unsigned int*)(attr_value + 4);
+                            unsigned int magic_cookie_net = htonl(0x2112A442);
+                            unsigned short real_port_net = port_net ^ htons(0x2112); unsigned int real_ip_net = ip_net ^ magic_cookie_net;
+                            public_port = ntohs(real_port_net);
+                            in_addr addr; addr.s_addr = real_ip_net;
+                            char ip_str[INET_ADDRSTRLEN];
+                            if (inet_ntop(AF_INET, &addr, ip_str, INET_ADDRSTRLEN) != NULL) {
+                                public_ip = ip_str; stun_success = true; break;
+                            }
+                        }
+                        p += 4 + len; if (len % 4 != 0) p += (4 - (len % 4));
+                    }
+                }
+            }
+        }
+
+        if (!stun_success) {
+            SetColor(RED); std::cerr << "[失败] 解析 STUN 响应失败。" << std::endl;
+            closesocket(listener_sock); closesocket(stun_heartbeat_sock);
+            if (config.auto_retry) { std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms)); continue; } else break;
+        }
+
+        // 步骤 7: 成功！保持心跳连接，开始接受外部连接
+        tcp_keepalive ka; ka.onoff = (u_long)1; ka.keepalivetime = config.keep_alive_ms; ka.keepaliveinterval = 1000;
+        DWORD bytes_returned;
+        WSAIoctl(stun_heartbeat_sock, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), NULL, 0, &bytes_returned, NULL, NULL);
+
+        SetColor(LIGHT_GREEN);
+        std::cout << "[成功] NAT映射已建立！公网端口 " << public_ip << ":" << public_port << " 已开启并监听。" << std::endl;
+        SetColor(YELLOW);
+        std::cout << "[服务] 所有传入连接将被转发到 " << config.forward_host << ":" << config.forward_port << std::endl;
+
+        while (true) {
+            SOCKET peer_sock = accept(listener_sock, NULL, NULL);
+            if (peer_sock == INVALID_SOCKET) {
+                SetColor(RED); std::cerr << "[警告] accept() 失败，可能心跳连接已断开，准备重试..." << std::endl;
+                break; 
+            }
+            std::thread(HandleNewConnection, peer_sock, config).detach();
+        }
+
         closesocket(listener_sock);
-        closesocket(heartbeat_sock);
+        closesocket(stun_heartbeat_sock);
         if (config.auto_retry) {
              SetColor(YELLOW); std::cout << "[准备重试] 等待 " << config.retry_interval_ms / 1000 << " 秒后将自动重试..." << std::endl;
              std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms));
@@ -242,8 +233,8 @@ int main(int argc, char* argv[]) {
     std::string iniPath = std::string(exePath) + "\\config.ini";
     Config config = ReadIniConfig(iniPath);
     SetColor(YELLOW);
-    std::cout << "--- TCP NAT 端口转发器 (最终修复版) ---" << std::endl;
-    std::cout << "本程序将通过保持一个长连接来稳定地打开NAT端口，" << std::endl;
+    std::cout << "--- TCP NAT 端口转发器 (最终版) ---" << std::endl;
+    std::cout << "本程序将通过与STUN服务器保持长连接来稳定地打开NAT端口，" << std::endl;
     std::cout << "并将所有流量转发到本地的 " << config.forward_host << ":" << config.forward_port << std::endl;
     PortForwardingThread(config);
     WSACleanup();
