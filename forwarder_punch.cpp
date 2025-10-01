@@ -25,7 +25,7 @@ struct Config {
     int local_punch_port;
     std::string forward_host;
     int forward_port;
-    std::string priming_host;
+    std::string priming_host; // 现在应该是一个高可用的服务器，如 qq.com
     int keep_alive_ms;
     int retry_interval_ms;
     bool auto_retry;
@@ -42,7 +42,7 @@ Config ReadIniConfig(const std::string& filePath) {
     GetPrivateProfileStringA("TCP_HolePunch", "ForwardHost", "127.0.0.1", buffer, sizeof(buffer), filePath.c_str());
     config.forward_host = buffer;
     config.forward_port = GetPrivateProfileIntA("TCP_HolePunch", "ForwardPort", 9999, filePath.c_str());
-    GetPrivateProfileStringA("TCP_HolePunch", "PrimingHost", "192.0.2.1", buffer, sizeof(buffer), filePath.c_str());
+    GetPrivateProfileStringA("TCP_HolePunch", "PrimingHost", "qq.com", buffer, sizeof(buffer), filePath.c_str());
     config.priming_host = buffer;
     config.keep_alive_ms = GetPrivateProfileIntA("TCP_HolePunch", "KeepAliveMS", 2300, filePath.c_str());
     config.retry_interval_ms = GetPrivateProfileIntA("TCP_HolePunch", "RetryIntervalMS", 30000, filePath.c_str());
@@ -61,7 +61,7 @@ bool RecvAll(SOCKET sock, char* buffer, int len) {
     return true;
 }
 
-// --- STUN 客户端 ---
+// --- STUN 客户端 (无需修改) ---
 bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_port) {
     SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock == INVALID_SOCKET) return false;
@@ -109,7 +109,7 @@ bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_p
     return false;
 }
 
-// --- TCP 代理 ---
+// --- TCP 代理 (无需修改) ---
 void TcpProxy(SOCKET s1, SOCKET s2, int keep_alive_ms) {
     tcp_keepalive ka; ka.onoff = (u_long)1; ka.keepalivetime = keep_alive_ms; ka.keepaliveinterval = 1000;
     DWORD bytes_returned;
@@ -123,7 +123,7 @@ void TcpProxy(SOCKET s1, SOCKET s2, int keep_alive_ms) {
     closesocket(s1); closesocket(s2);
 }
 
-// --- 连接处理 ---
+// --- 连接处理 (无需修改) ---
 void HandleNewConnection(SOCKET peer_sock, Config config) {
     sockaddr_in peer_addr; int peer_addr_len = sizeof(peer_addr);
     getpeername(peer_sock, (sockaddr*)&peer_addr, &peer_addr_len);
@@ -140,14 +140,14 @@ void HandleNewConnection(SOCKET peer_sock, Config config) {
         closesocket(peer_sock);
     } else {
         SetColor(YELLOW);
-        std::cout << "[转发] 开始转发 " << peer_ip_str << " <==> " << config.forward_host << ":" << config.forward_port << std::endl;
+        std::cout << "[转发] 开始转发 " << peer_ip_str << " <==> " << config.forward_host << ":" << config.port << std::endl;
         std::thread(TcpProxy, peer_sock, target_sock, config.keep_alive_ms).detach();
         std::thread(TcpProxy, target_sock, peer_sock, config.keep_alive_ms).detach();
     }
     freeaddrinfo(fwd_res);
 }
 
-// --- 单边打洞并监听的主逻辑 ---
+// --- 单边打洞并监听的主逻辑 (最终修复版) ---
 void PortForwardingThread(Config config) {
     do {
         SetColor(WHITE);
@@ -163,52 +163,71 @@ void PortForwardingThread(Config config) {
         SetColor(LIGHT_GREEN);
         std::cout << "[成功] 当前公网端口为: " << public_ip << ":" << public_port << std::endl;
 
+        // 步骤 2: 创建并设置两个套接字
         SOCKET listener_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        SOCKET heartbeat_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        
         BOOL reuse = TRUE;
         setsockopt(listener_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+        setsockopt(heartbeat_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+
         sockaddr_in local_addr = { AF_INET, htons(config.local_punch_port), {INADDR_ANY} };
-        if (bind(listener_sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR) {
-            SetColor(RED); std::cerr << "[错误] 无法绑定本地端口 " << config.local_punch_port << "。" << std::endl;
-            closesocket(listener_sock);
+
+        // 步骤 3: 绑定两个套接字到同一本地端口
+        if (bind(listener_sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR ||
+            bind(heartbeat_sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR) {
+            SetColor(RED); std::cerr << "[错误] 无法绑定本地端口 " << config.local_punch_port << "。错误码: " << WSAGetLastError() << std::endl;
+            closesocket(listener_sock); closesocket(heartbeat_sock);
             if (config.auto_retry) { std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms)); continue; } else break;
         }
         SetColor(CYAN);
-        std::cout << "[步骤 2] 套接字已成功绑定至本地端口 " << config.local_punch_port << "。" << std::endl;
+        std::cout << "[步骤 2] 两个套接字已成功绑定至本地端口 " << config.local_punch_port << "。" << std::endl;
 
+        // 步骤 4: 监听套接字进入监听状态
+        if (listen(listener_sock, SOMAXCONN) == SOCKET_ERROR) {
+            SetColor(RED); std::cerr << "[错误] 监听套接字 listen() 失败。" << std::endl;
+            closesocket(listener_sock); closesocket(heartbeat_sock);
+            if (config.auto_retry) { std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms)); continue; } else break;
+        }
+
+        // 步骤 5: 心跳套接字连接公网服务器以“撑开”NAT映射
         SetColor(CYAN);
-        std::cout << "[步骤 3] 正在向 '" << config.priming_host << "' 发送打洞包..." << std::endl;
+        std::cout << "[步骤 3] 正在连接 '" << config.priming_host << "' 以建立并保持NAT映射..." << std::endl;
         addrinfo* prime_res = nullptr;
         getaddrinfo(config.priming_host.c_str(), "80", nullptr, &prime_res);
         if (prime_res) {
-            DWORD timeout = 1000; // 1秒
-            setsockopt(listener_sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
-            connect(listener_sock, prime_res->ai_addr, (int)prime_res->ai_addrlen);
-            freeaddrinfo(prime_res);
-
-            if (listen(listener_sock, SOMAXCONN) == SOCKET_ERROR) {
-                 SetColor(RED);
-                 std::cerr << "[错误] 套接字 listen() 失败。错误码: " << WSAGetLastError() << std::endl;
-                 closesocket(listener_sock);
-                 if (config.auto_retry) { std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms)); continue; } else break;
+            if (connect(heartbeat_sock, prime_res->ai_addr, (int)prime_res->ai_addrlen) == SOCKET_ERROR) {
+                SetColor(RED); std::cerr << "[失败] 无法连接到保持服务器 '" << config.priming_host << "'。" << std::endl;
+                freeaddrinfo(prime_res);
+                closesocket(listener_sock); closesocket(heartbeat_sock);
+                if (config.auto_retry) { std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms)); continue; } else break;
             }
+            freeaddrinfo(prime_res);
             
+            // 设置TCP Keep-Alive以确保连接不被空闲断开
+            tcp_keepalive ka; ka.onoff = (u_long)1; ka.keepalivetime = config.keep_alive_ms; ka.keepaliveinterval = 1000;
+            DWORD bytes_returned;
+            WSAIoctl(heartbeat_sock, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), NULL, 0, &bytes_returned, NULL, NULL);
+
             SetColor(GREEN);
-            std::cout << "[成功] 打洞完成！公网端口 " << public_port << " 已开启并监听。" << std::endl;
+            std::cout << "[成功] NAT映射已建立！公网端口 " << public_port << " 已开启并监听。" << std::endl;
             SetColor(YELLOW);
             std::cout << "[服务] 所有传入连接将被转发到 " << config.forward_host << ":" << config.forward_port << std::endl;
 
+            // 步骤 6: 在监听套接字上循环接受连接
             while (true) {
                 SOCKET peer_sock = accept(listener_sock, NULL, NULL);
                 if (peer_sock == INVALID_SOCKET) {
                     SetColor(RED); std::cerr << "[警告] accept() 失败，准备重试..." << std::endl;
-                    break;
+                    break; 
                 }
                 std::thread(HandleNewConnection, peer_sock, config).detach();
             }
         } else {
-             SetColor(RED); std::cerr << "[错误] 无法解析预热主机 '" << config.priming_host << "'。" << std::endl;
+             SetColor(RED); std::cerr << "[错误] 无法解析保持服务器 '" << config.priming_host << "'。" << std::endl;
         }
         closesocket(listener_sock);
+        closesocket(heartbeat_sock);
         if (config.auto_retry) {
              SetColor(YELLOW); std::cout << "[准备重试] 等待 " << config.retry_interval_ms / 1000 << " 秒后将自动重试..." << std::endl;
              std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms));
@@ -228,8 +247,8 @@ int main(int argc, char* argv[]) {
     std::string iniPath = std::string(exePath) + "\\config.ini";
     Config config = ReadIniConfig(iniPath);
     SetColor(YELLOW);
-    std::cout << "--- TCP NAT 端口转发器 (修复版) ---" << std::endl;
-    std::cout << "本程序将尝试通过STUN在NAT上打开一个公网端口，" << std::endl;
+    std::cout << "--- TCP NAT 端口转发器 (最终修复版) ---" << std::endl;
+    std::cout << "本程序将通过保持一个长连接来稳定地打开NAT端口，" << std::endl;
     std::cout << "并将所有流量转发到本地的 " << config.forward_host << ":" << config.forward_port << std::endl;
     PortForwardingThread(config);
     WSACleanup();
