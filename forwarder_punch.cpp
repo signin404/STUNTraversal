@@ -52,18 +52,29 @@ Config ReadIniConfig(const std::string& filePath) {
     return config;
 }
 
-// --- STUN 客户端 (STUN over TCP 模式) ---
+// --- 辅助函数：健壮地从TCP流中读取指定长度的数据 ---
+bool RecvAll(SOCKET sock, char* buffer, int len) {
+    int total_received = 0;
+    while (total_received < len) {
+        int bytes = recv(sock, buffer + total_received, len - total_received, 0);
+        if (bytes <= 0) {
+            return false; // 连接关闭或出错
+        }
+        total_received += bytes;
+    }
+    return true;
+}
+
+// --- STUN 客户端 (STUN over TCP 模式 - 已修复TCP流读取逻辑) ---
 bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_port) {
-    // FIX: Create a TCP socket
     SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     
     addrinfo* stun_res = nullptr;
     getaddrinfo(config.stun_server_host.c_str(), std::to_string(config.stun_server_port).c_str(), nullptr, &stun_res);
     if (!stun_res) { closesocket(sock); return false; }
     
-    // FIX: Establish a TCP connection with a timeout
     u_long mode = 1;
-    ioctlsocket(sock, FIONBIO, &mode); // Set non-blocking for connect timeout
+    ioctlsocket(sock, FIONBIO, &mode);
     connect(sock, stun_res->ai_addr, (int)stun_res->ai_addrlen);
     
     fd_set write_set;
@@ -71,52 +82,76 @@ bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_p
     FD_SET(sock, &write_set);
     timeval timeout = { 3, 0 };
     
-    bool success = false;
+    bool connected = false;
     if (select(0, NULL, &write_set, NULL, &timeout) > 0) {
         int opt_val;
         int opt_len = sizeof(opt_val);
         if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&opt_val, &opt_len) == 0 && opt_val == 0) {
-            success = true;
+            connected = true;
         }
     }
     
     freeaddrinfo(stun_res);
     mode = 0;
-    ioctlsocket(sock, FIONBIO, &mode); // Restore blocking mode
+    ioctlsocket(sock, FIONBIO, &mode);
 
-    if (!success) {
+    if (!connected) {
         closesocket(sock);
         return false;
     }
 
-    // FIX: Build a modern 20-byte STUN request (as seen in Wireshark)
     char req[20] = { 0 };
-    *(unsigned short*)req = htons(0x0001);         // Message Type: Binding Request
-    *(unsigned short*)(req + 2) = 0;               // Message Length: 0 (no attributes)
-    *(unsigned int*)(req + 4) = htonl(0x2112A442); // Magic Cookie
+    *(unsigned short*)req = htons(0x0001);
+    *(unsigned short*)(req + 2) = 0;
+    *(unsigned int*)(req + 4) = htonl(0x2112A442);
 
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<unsigned int> dis;
     for (int i = 0; i < 3; ++i) {
-        *(unsigned int*)(req + 8 + i * 4) = dis(gen); // 12-byte Transaction ID
+        *(unsigned int*)(req + 8 + i * 4) = dis(gen);
     }
 
-    // FIX: Send request over the established TCP stream
-    send(sock, req, sizeof(req), 0);
+    if (send(sock, req, sizeof(req), 0) == SOCKET_ERROR) {
+        closesocket(sock);
+        return false;
+    }
 
-    // FIX: Receive response from the same TCP stream
+    // --- FIX: Robust two-stage TCP stream reading ---
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
-    char buffer[1500];
-    int bytes = recv(sock, buffer, sizeof(buffer), 0);
-    closesocket(sock);
+    
+    // Stage 1: Read exactly 20 bytes for the header
+    char header_buffer[20];
+    if (!RecvAll(sock, header_buffer, 20)) {
+        closesocket(sock);
+        return false;
+    }
 
-    if (bytes <= 0) return false;
+    // Stage 2: Parse message length and read the rest of the message
+    unsigned short msg_len = ntohs(*(unsigned short*)(header_buffer + 2));
+    if (msg_len > 1400) { // Sanity check
+        closesocket(sock);
+        return false;
+    }
 
-    // Parse the response (modern STUN with XOR-MAPPED-ADDRESS)
-    if (!((buffer[0] == 0x01) && (buffer[1] == 0x01))) return false;
-    const char* p = buffer + 20;
-    while (p < buffer + bytes) {
+    std::vector<char> attr_buffer(msg_len);
+    if (msg_len > 0 && !RecvAll(sock, attr_buffer.data(), msg_len)) {
+        closesocket(sock);
+        return false;
+    }
+    closesocket(sock); // We have the full message, close the socket
+
+    // Combine header and attributes into one buffer for parsing
+    std::vector<char> full_message(20 + msg_len);
+    memcpy(full_message.data(), header_buffer, 20);
+    if (msg_len > 0) {
+        memcpy(full_message.data() + 20, attr_buffer.data(), msg_len);
+    }
+
+    // Parse the complete response
+    if (!((full_message[0] == 0x01) && (full_message[1] == 0x01))) return false;
+    const char* p = full_message.data() + 20;
+    while (p < full_message.data() + full_message.size()) {
         unsigned short type = ntohs(*(unsigned short*)p);
         unsigned short len = ntohs(*(unsigned short*)(p + 2));
         if (type == 0x0020) { // XOR-MAPPED-ADDRESS
@@ -130,7 +165,7 @@ bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_p
             out_port = port;
             return true;
         }
-        p += (4 + len);
+        p += (4 + (len % 4 == 0 ? len : len + (4 - len % 4))); // Attributes are 4-byte aligned
     }
     return false;
 }
