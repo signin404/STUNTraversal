@@ -3,7 +3,6 @@
 #include <thread>
 #include <vector>
 #include <chrono>
-#include <random>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -14,295 +13,86 @@
 #pragma comment(lib, "shlwapi.lib")
 
 // --- 控制台颜色管理 ---
-enum ConsoleColor { DARKBLUE = 1, GREEN = 2, CYAN = 3, RED = 4, MAGENTA = 5, YELLOW = 6, WHITE = 7, GRAY = 8, LIGHT_GREEN = 10 };
+enum ConsoleColor { GREEN = 2, CYAN = 3, RED = 4, YELLOW = 6, WHITE = 7, LIGHT_GREEN = 10 };
 HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
 void SetColor(ConsoleColor color) { SetConsoleTextAttribute(hConsole, color); }
 
-// --- 配置结构体 ---
-struct Config {
-    std::string stun_server_host;
-    int stun_server_port;
-    int tcp_local_listen_port;
-    std::string tcp_forward_host;
-    int tcp_forward_port;
-    std::string tcp_priming_host;
-    int tcp_punch_timeout_ms;
-    int tcp_keep_alive_ms;
-    int tcp_retry_interval_ms;
-    bool tcp_auto_retry;
-};
+// --- 主函数 ---
+int main(int argc, char* argv[]) {
+    SetConsoleOutputCP(65001);
+    SetConsoleTitleA("Proprietary Protocol Cloner");
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
 
-// --- INI 文件解析 ---
-Config ReadIniConfig(const std::string& filePath) {
-    Config config;
-    char buffer[1024];
-    GetPrivateProfileStringA("STUN", "ServerHost", "stun.l.google.com", buffer, sizeof(buffer), filePath.c_str());
-    config.stun_server_host = buffer;
-    config.stun_server_port = GetPrivateProfileIntA("STUN", "ServerPort", 19302, filePath.c_str());
-    config.tcp_local_listen_port = GetPrivateProfileIntA("TCP_HolePunch", "LocalListenPort", 8001, filePath.c_str());
-    GetPrivateProfileStringA("TCP_HolePunch", "ForwardHost", "127.0.0.1", buffer, sizeof(buffer), filePath.c_str());
-    config.tcp_forward_host = buffer;
-    config.tcp_forward_port = GetPrivateProfileIntA("TCP_HolePunch", "ForwardPort", 23000, filePath.c_str());
-    GetPrivateProfileStringA("TCP_HolePunch", "PrimingHost", "qq.com", buffer, sizeof(buffer), filePath.c_str());
-    config.tcp_priming_host = buffer;
-    config.tcp_punch_timeout_ms = GetPrivateProfileIntA("TCP_HolePunch", "PunchTimeoutMS", 3000, filePath.c_str());
-    config.tcp_keep_alive_ms = GetPrivateProfileIntA("TCP_HolePunch", "KeepAliveMS", 2300, filePath.c_str());
-    config.tcp_retry_interval_ms = GetPrivateProfileIntA("TCP_HolePunch", "RetryIntervalMS", 3000, filePath.c_str());
-    config.tcp_auto_retry = GetPrivateProfileIntA("TCP_HolePunch", "AutoRetry", 1, filePath.c_str()) == 1;
-    return config;
-}
+    // --- 关键部分：用从 Wireshark 抓取到的十六进制数据替换这里 ---
+    // 示例：如果抓到的是 01 02 03 04 ...
+    // 注意：这是一个示例，你需要用你抓到的真实数据替换它！
+    unsigned char SECRET_HANDSHAKE[] = {
+        0x00, 0x01, 0x00, 0x00, 0xDE, 0xAD, 0xBE, 0xEF, 
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0A, 0x0B, 0x0C
+    };
 
-// --- STUN 客户端 (古老 RFC 3489 模式 + CHANGE-REQUEST) ---
-bool GetPublicEndpoint_Legacy(const Config& config, std::string& out_ip, int& out_port) {
+    const char* SERVER_IP = "137.74.112.113";
+    const int SERVER_PORT = 3478;
+
+    SetColor(WHITE);
+    std::cout << "正在尝试使用克隆的数据包进行连接..." << std::endl;
+
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     
-    addrinfo* stun_res = nullptr;
-    getaddrinfo(config.stun_server_host.c_str(), std::to_string(config.stun_server_port).c_str(), nullptr, &stun_res);
-    if (!stun_res) { closesocket(sock); return false; }
-    sockaddr_in stun_addr = *(sockaddr_in*)stun_res->ai_addr;
-    freeaddrinfo(stun_res);
+    sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(SERVER_PORT);
+    inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr);
 
-    // --- FIX: Build a 28-byte request including the CHANGE-REQUEST attribute ---
-    char req[28] = { 0 };
-    // Header (20 bytes)
-    *(unsigned short*)req = htons(0x0001); // Message Type: Binding Request
-    *(unsigned short*)(req + 2) = htons(8); // Message Length: 8 bytes for one attribute
-
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<unsigned int> dis;
-    for (int i = 0; i < 4; ++i) {
-        *(unsigned int*)(req + 4 + i * 4) = dis(gen); // 16-byte Transaction ID
-    }
-
-    // Attribute (8 bytes)
-    *(unsigned short*)(req + 20) = htons(0x0003); // Attribute Type: CHANGE-REQUEST
-    *(unsigned short*)(req + 22) = htons(4);      // Attribute Length: 4 bytes
-    *(unsigned int*)(req + 24) = 0;               // Value: 0 (no change requested)
-
-    sendto(sock, req, sizeof(req), 0, (const sockaddr*)&stun_addr, sizeof(stun_addr));
+    // 发送“秘密暗号”
+    sendto(sock, (const char*)SECRET_HANDSHAKE, sizeof(SECRET_HANDSHAKE), 0, (const sockaddr*)&server_addr, sizeof(server_addr));
+    SetColor(CYAN);
+    std::cout << "克隆包已发送至 " << SERVER_IP << ":" << SERVER_PORT << std::endl;
 
     timeval timeout = { 3, 0 };
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
 
     char buffer[1500];
-    int bytes = recvfrom(sock, buffer, sizeof(buffer), 0, NULL, NULL);
-    closesocket(sock);
-
-    if (bytes <= 0) return false;
-
-    if (!((buffer[0] == 0x01) && (buffer[1] == 0x01))) return false;
+    sockaddr_in recv_addr;
+    int recv_addr_len = sizeof(recv_addr);
+    int bytes = recvfrom(sock, buffer, sizeof(buffer), 0, (sockaddr*)&recv_addr, &recv_addr_len);
     
-    const char* p = buffer + 20;
-    while (p < buffer + bytes) {
-        unsigned short type = ntohs(*(unsigned short*)p);
-        unsigned short len = ntohs(*(unsigned short*)(p + 2));
-        if (type == 0x0001) { // MAPPED-ADDRESS
-            unsigned short port = ntohs(*(unsigned short*)(p + 6));
-            in_addr addr;
-            addr.s_addr = *(unsigned int*)(p + 8);
-            out_ip = inet_ntoa(addr);
-            out_port = port;
-            return true;
-        }
-        p += (4 + len);
-    }
-    return false;
-}
-
-// --- TCP 代理和心跳 ---
-void TcpProxy(SOCKET s1, SOCKET s2, int keep_alive_ms) {
-    tcp_keepalive ka;
-    ka.onoff = (u_long)1;
-    ka.keepalivetime = keep_alive_ms;
-    ka.keepaliveinterval = 1000;
-    DWORD bytes_returned;
-    WSAIoctl(s1, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), NULL, 0, &bytes_returned, NULL, NULL);
-    
-    char buffer[8192];
-    while (true) {
-        int bytes = recv(s1, buffer, sizeof(buffer), 0);
-        if (bytes <= 0) break;
-        if (send(s2, buffer, bytes, 0) <= 0) break;
-    }
-    closesocket(s1);
-    closesocket(s2);
-}
-
-// --- TCP 打洞主逻辑 ---
-void TcpHolePunchingThread(Config config, bool is_listener, const std::string& peer_addr_str) {
-    do {
-        SetColor(WHITE);
-        std::cout << "\n--- 开始新一轮穿透尝试 ---" << std::endl;
-
-        SetColor(CYAN);
-        std::cout << "[步骤 1] 正在通过 STUN 服务器发现公网地址 (兼容模式)..." << std::endl;
-        std::string my_public_ip;
-        int my_public_port;
-        if (!GetPublicEndpoint_Legacy(config, my_public_ip, my_public_port)) {
-            SetColor(RED);
-            std::cerr << "[失败] STUN 请求超时或失败。请检查服务器地址或网络连接。" << std::endl;
-            if (config.tcp_auto_retry) {
-                SetColor(YELLOW);
-                std::cout << "[准备重试] 等待 " << config.tcp_retry_interval_ms << " 毫秒后将自动重试..." << std::endl;
-                std::this_thread::sleep_for(std::chrono::milliseconds(config.tcp_retry_interval_ms));
-                continue;
-            } else {
-                break;
-            }
-        }
-        
+    if (bytes > 0) {
         SetColor(LIGHT_GREEN);
-        std::cout << "[成功] 我的公网地址是: " << my_public_ip << ":" << my_public_port << std::endl;
-        if (is_listener) {
-            SetColor(YELLOW);
-            std::cout << "[操作] 请将此地址发送给连接方。" << std::endl;
-        }
-
-        SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        BOOL reuse = TRUE;
-        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+        std::cout << "\n[成功] 收到了服务器的响应！ (" << bytes << " 字节)" << std::endl;
         
-        sockaddr_in local_addr = { AF_INET, htons(config.tcp_local_listen_port), {INADDR_ANY} };
-        if (bind(sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR) {
-            SetColor(RED);
-            std::cerr << "[错误] 无法绑定本地端口 " << config.tcp_local_listen_port << "。该端口可能已被占用。" << std::endl;
-            closesocket(sock);
-            if (config.tcp_auto_retry) {
-                SetColor(YELLOW);
-                std::cout << "[准备重试] 等待 " << config.tcp_retry_interval_ms << " 毫秒后将自动重试..." << std::endl;
-                std::this_thread::sleep_for(std::chrono::milliseconds(config.tcp_retry_interval_ms));
-                continue;
-            } else {
-                break;
-            }
-        }
-
-        SetColor(CYAN);
-        std::cout << "[步骤 2] 套接字已成功绑定至本地端口 " << config.tcp_local_listen_port << "。" << std::endl;
-
-        SetColor(CYAN);
-        std::cout << "[步骤 3] 正在通过连接 '" << config.tcp_priming_host << "' 来预热 NAT..." << std::endl;
-        addrinfo* prime_res = nullptr;
-        getaddrinfo(config.tcp_priming_host.c_str(), "80", nullptr, &prime_res);
-        u_long mode = 1;
-        ioctlsocket(sock, FIONBIO, &mode);
-        connect(sock, prime_res->ai_addr, (int)prime_res->ai_addrlen);
-        freeaddrinfo(prime_res);
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        mode = 0;
-        ioctlsocket(sock, FIONBIO, &mode);
-        SetColor(GREEN);
-        std::cout << "[成功] NAT 预热包已发送。" << std::endl;
-
-        SOCKET peer_sock = INVALID_SOCKET;
-        if (is_listener) {
-            SetColor(CYAN);
-            std::cout << "[步骤 4] 正在监听等待对方连接..." << std::endl;
-            listen(sock, 1);
-            
-            timeval timeout = { config.tcp_punch_timeout_ms / 1000, (config.tcp_punch_timeout_ms % 1000) * 1000 };
-            fd_set read_set;
-            FD_ZERO(&read_set);
-            FD_SET(sock, &read_set);
-            if (select(0, &read_set, NULL, NULL, &timeout) > 0) {
-                peer_sock = accept(sock, NULL, NULL);
+        // 尝试像旧版STUN一样解析 MAPPED-ADDRESS
+        if (bytes >= 28 && buffer[0] == 0x01 && buffer[1] == 0x01) {
+            const char* p = buffer + 20;
+            while (p < buffer + bytes) {
+                unsigned short type = ntohs(*(unsigned short*)p);
+                unsigned short len = ntohs(*(unsigned short*)(p + 2));
+                if (type == 0x0001) { // MAPPED-ADDRESS
+                    unsigned short port = ntohs(*(unsigned short*)(p + 6));
+                    in_addr addr;
+                    addr.s_addr = *(unsigned int*)(p + 8);
+                    SetColor(YELLOW);
+                    std::cout << "[解析成功] 你的公网地址可能是: " << inet_ntoa(addr) << ":" << port << std::endl;
+                    break;
+                }
+                p += (4 + len);
             }
         } else {
-            SetColor(CYAN);
-            std::cout << "[步骤 4] 正在连接对端地址 " << peer_addr_str << "..." << std::endl;
-            size_t colon_pos = peer_addr_str.find(':');
-            std::string peer_ip = peer_addr_str.substr(0, colon_pos);
-            int peer_port = std::stoi(peer_addr_str.substr(colon_pos + 1));
-            
-            sockaddr_in peer_addr = { AF_INET, htons(peer_port) };
-            inet_pton(AF_INET, peer_ip.c_str(), &peer_addr.sin_addr);
-
-            timeval timeout = { config.tcp_punch_timeout_ms / 1000, (config.tcp_punch_timeout_ms % 1000) * 1000 };
-            fd_set write_set;
-            FD_ZERO(&write_set);
-            FD_SET(sock, &write_set);
-            
-            mode = 1;
-            ioctlsocket(sock, FIONBIO, &mode);
-            connect(sock, (sockaddr*)&peer_addr, sizeof(peer_addr));
-            if (select(0, NULL, &write_set, NULL, &timeout) > 0) {
-                peer_sock = sock;
-            }
-            mode = 0;
-            ioctlsocket(sock, FIONBIO, &mode);
-        }
-
-        if (peer_sock != INVALID_SOCKET) {
-            SetColor(LIGHT_GREEN);
-            std::cout << "\n[穿透成功] TCP 打洞成功！P2P 直连已建立。" << std::endl;
             SetColor(YELLOW);
-            std::cout << "[开始转发] 正在代理 P2P 连接与本地目标 " << config.tcp_forward_host << ":" << config.tcp_forward_port << " 之间的数据。" << std::endl;
-
-            SOCKET target_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-            addrinfo* fwd_res = nullptr;
-            getaddrinfo(config.tcp_forward_host.c_str(), std::to_string(config.tcp_forward_port).c_str(), nullptr, &fwd_res);
-            if (connect(target_sock, fwd_res->ai_addr, (int)fwd_res->ai_addrlen) == SOCKET_ERROR) {
-                SetColor(RED);
-                std::cerr << "[错误] 无法连接到本地转发目标。" << std::endl;
-            } else {
-                std::thread(TcpProxy, peer_sock, target_sock, config.tcp_keep_alive_ms).detach();
-                std::thread(TcpProxy, target_sock, peer_sock, config.tcp_keep_alive_ms).join();
-            }
-            freeaddrinfo(fwd_res);
-            closesocket(target_sock);
-            SetColor(WHITE);
-            std::cout << "[连接关闭] P2P 连接已断开。" << std::endl;
-        } else {
-            SetColor(RED);
-            std::cerr << "[穿透失败] TCP 打洞失败 (连接超时)。" << std::endl;
-            closesocket(sock);
+            std::cout << "[信息] 响应格式未知，但连接已探通。" << std::endl;
         }
 
-        if (config.tcp_auto_retry) {
-            SetColor(YELLOW);
-            std::cout << "[准备重试] 等待 " << config.tcp_retry_interval_ms << " 毫秒后将自动重试..." << std::endl;
-            std::this_thread::sleep_for(std::chrono::milliseconds(config.tcp_retry_interval_ms));
-        }
-    } while (config.tcp_auto_retry);
-}
-
-// --- 主函数 ---
-int main(int argc, char* argv[]) {
-    SetConsoleOutputCP(65001);
-    SetConsoleTitleA("TCP NAT 穿透转发器");
-    WSADATA wsaData;
-    WSAStartup(MAKEWORD(2, 2), &wsaData);
-
-    if (argc < 2 || (strcmp(argv[1], "listen") != 0 && strcmp(argv[1], "connect") != 0)) {
-        SetColor(YELLOW);
-        std::cout << "用法说明:\n";
-        std::cout << "  作为监听方:  forwarder.exe listen\n";
-        std::cout << "  作为连接方:  forwarder.exe connect <监听方的公网IP:端口>\n";
-        WSACleanup();
-        return 1;
+    } else {
+        SetColor(RED);
+        std::cerr << "\n[失败] 克隆包未收到响应，超时。" << std::endl;
     }
 
-    bool is_listener = (strcmp(argv[1], "listen") == 0);
-    std::string peer_addr_str = "";
-    if (!is_listener) {
-        if (argc < 3) {
-            SetColor(RED);
-            std::cerr << "错误: 连接方模式需要提供对端的公网地址。" << std::endl;
-            return 1;
-        }
-        peer_addr_str = argv[2];
-    }
-
-    char exePath[MAX_PATH];
-    GetModuleFileNameA(NULL, exePath, MAX_PATH);
-    PathRemoveFileSpecA(exePath);
-    std::string iniPath = std::string(exePath) + "\\config.ini";
-    
-    Config config = ReadIniConfig(iniPath);
-
-    TcpHolePunchingThread(config, is_listener, peer_addr_str);
-
+    closesocket(sock);
     WSACleanup();
+    
+    std::cout << "\n按任意键退出..." << std::endl;
+    std::cin.get();
     return 0;
 }
