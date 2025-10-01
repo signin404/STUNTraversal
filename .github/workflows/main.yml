@@ -1,11 +1,10 @@
-name: Build C++ UDP Forwarder for Windows
+name: Build C++ TCP Hole Punching Forwarder
 
 on:
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-  # 允许手动触发工作流
   workflow_dispatch:
 
 jobs:
@@ -20,16 +19,32 @@ jobs:
       uses: ilammy/msvc-dev-cmd@v1
 
     - name: Compile C++ code
-      run: cl.exe udp_forwarder.cpp /std:c++17 /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 /Fe:udp_forwarder.exe /link Ws2_32.lib Shlwapi.lib
+      run: cl.exe forwarder_punch.cpp /std:c++17 /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 /Fe:forwarder.exe /link Ws2_32.lib Shlwapi.lib
 
     - name: Prepare artifact for upload
+      shell: pwsh
       run: |
         mkdir release
-        copy udp_forwarder.exe release\
-        copy config.ini release\
+        copy forwarder.exe release\
+        
+        Set-Content -Path "release\config.ini" -Value @"
+[STUN]
+ServerHost=stun.l.google.com
+ServerPort=19302
+
+[TCP_HolePunch]
+LocalListenPort=8001
+ForwardHost=127.0.0.1
+ForwardPort=23000
+PrimingHost=qq.com
+PunchTimeoutMS=3000
+KeepAliveMS=2300
+RetryIntervalMS=3000
+AutoRetry=1
+"@
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: udp-forwarder-windows
+        name: tcp-hole-punch-forwarder
         path: release/
