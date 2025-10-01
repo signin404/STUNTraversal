@@ -63,14 +63,19 @@ bool RecvAll(SOCKET sock, char* buffer, int len) {
     return true;
 }
 
-// --- STUN 客户端 (已修复 inet_ntoa 内存损坏问题) ---
+// --- STUN 客户端 (已修复 XOR 解码及 inet_ntoa 内存损坏问题) ---
 bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_port) {
     SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    
+    if (sock == INVALID_SOCKET) {
+        return false;
+    }
+
     addrinfo* stun_res = nullptr;
-    getaddrinfo(config.stun_server_host.c_str(), std::to_string(config.stun_server_port).c_str(), nullptr, &stun_res);
-    if (!stun_res) { closesocket(sock); return false; }
-    
+    if (getaddrinfo(config.stun_server_host.c_str(), std::to_string(config.stun_server_port).c_str(), nullptr, &stun_res) != 0 || !stun_res) {
+        closesocket(sock);
+        return false;
+    }
+
     DWORD timeout_ms = 3000;
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms));
 
@@ -82,12 +87,13 @@ bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_p
     freeaddrinfo(stun_res);
 
     char req[20] = { 0 };
-    *(unsigned short*)req = htons(0x0001);
-    *(unsigned short*)(req + 2) = 0;
-    *(unsigned int*)(req + 4) = htonl(0x2112A442);
+    *(unsigned short*)req = htons(0x0001); // Message Type: Binding Request
+    *(unsigned short*)(req + 2) = 0;       // Message Length
+    *(unsigned int*)(req + 4) = htonl(0x2112A442); // Magic Cookie
 
+    // Transaction ID
     std::random_device rd;
-    std::mt19937 gen(rd());
+    std::mt1937 gen(rd());
     std::uniform_int_distribution<unsigned int> dis;
     for (int i = 0; i < 3; ++i) {
         *(unsigned int*)(req + 8 + i * 4) = dis(gen);
@@ -99,15 +105,23 @@ bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_p
     }
 
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms));
-    
+
     char header_buffer[20];
     if (!RecvAll(sock, header_buffer, 20)) {
         closesocket(sock);
         return false;
     }
 
+    if (!((header_buffer[0] == 0x01) && (header_buffer[1] == 0x01))) { // Check for Binding Success Response
+        closesocket(sock);
+        return false;
+    }
+
     unsigned short msg_len = ntohs(*(unsigned short*)(header_buffer + 2));
-    if (msg_len > 1400) { closesocket(sock); return false; }
+    if (msg_len > 1400) {
+        closesocket(sock);
+        return false;
+    }
 
     std::vector<char> attr_buffer(msg_len);
     if (msg_len > 0 && !RecvAll(sock, attr_buffer.data(), msg_len)) {
@@ -116,37 +130,43 @@ bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_p
     }
     closesocket(sock);
 
-    std::vector<char> full_message(20 + msg_len);
-    memcpy(full_message.data(), header_buffer, 20);
-    if (msg_len > 0) {
-        memcpy(full_message.data() + 20, attr_buffer.data(), msg_len);
-    }
+    const char* p = attr_buffer.data();
+    const char* end = p + msg_len;
 
-    if (!((full_message[0] == 0x01) && (full_message[1] == 0x01))) return false;
-    const char* p = full_message.data() + 20;
-    while (p < full_message.data() + full_message.size()) {
+    while (p < end) {
         unsigned short type = ntohs(*(unsigned short*)p);
         unsigned short len = ntohs(*(unsigned short*)(p + 2));
-        if (type == 0x0020) {
-            unsigned short port = ntohs(*(unsigned short*)(p + 6));
-            unsigned int ip = ntohl(*(unsigned int*)(p + 8));
-            port ^= (ntohl(0x2112A442) >> 16);
-            ip ^= ntohl(0x2112A442);
+        const char* attr_value = p + 4;
+
+        if (type == 0x0020) { // XOR-MAPPED-ADDRESS
+            // 从缓冲区读取端口和IP（网络字节序）
+            unsigned short port_net = *(unsigned short*)(attr_value + 2);
+            unsigned int ip_net = *(unsigned int*)(attr_value + 4);
+
+            // 将 Magic Cookie 转换为网络字节序以进行异或
+            unsigned int magic_cookie_net = htonl(0x2112A442);
+
+            // 端口与 Magic Cookie 的高16位进行异或
+            unsigned short real_port_net = port_net ^ htons(0x2112);
+            // IP 与完整的 Magic Cookie 进行异或
+            unsigned int real_ip_net = ip_net ^ magic_cookie_net;
+
+            // 将解码后的真实 IP 和端口从网络字节序转换为主机字节序
+            out_port = ntohs(real_port_net);
             
             in_addr addr;
-            addr.s_addr = htonl(ip);
-            
-            // --- FIX: Use the modern, safe inet_ntop instead of the deprecated inet_ntoa ---
+            addr.s_addr = real_ip_net; // real_ip_net 已经是网络字节序，可直接使用
+
             char ip_str[INET_ADDRSTRLEN];
             if (inet_ntop(AF_INET, &addr, ip_str, INET_ADDRSTRLEN) != NULL) {
                 out_ip = ip_str;
-                out_port = port;
                 return true;
             } else {
-                return false; // Conversion failed
+                return false; // 转换失败
             }
         }
-        // Correctly handle padding
+        
+        // 正确地移动到下一个属性，处理4字节对齐
         p += 4 + len;
         if (len % 4 != 0) {
             p += (4 - (len % 4));
@@ -154,6 +174,7 @@ bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_p
     }
     return false;
 }
+
 
 // --- TCP 代理和心跳 ---
 void TcpProxy(SOCKET s1, SOCKET s2, int keep_alive_ms) {
