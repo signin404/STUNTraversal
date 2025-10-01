@@ -52,20 +52,8 @@ Config ReadIniConfig(const std::string& filePath) {
     return config;
 }
 
-// --- FIX: CRC32 implementation for STUN FINGERPRINT ---
-uint32_t crc32(const char* data, size_t length) {
-    uint32_t crc = 0xFFFFFFFF;
-    for (size_t i = 0; i < length; ++i) {
-        crc ^= data[i];
-        for (int j = 0; j < 8; ++j) {
-            crc = (crc & 1) ? (crc >> 1) ^ 0xEDB88320 : (crc >> 1);
-        }
-    }
-    return crc ^ 0xFFFFFFFF;
-}
-
-// --- STUN 客户端 (已升级) ---
-bool GetPublicEndpoint(const Config& config, std::string& out_ip, int& out_port) {
+// --- STUN 客户端 (古老 RFC 3489 模式) ---
+bool GetPublicEndpoint_Legacy(const Config& config, std::string& out_ip, int& out_port) {
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     
     addrinfo* stun_res = nullptr;
@@ -74,27 +62,18 @@ bool GetPublicEndpoint(const Config& config, std::string& out_ip, int& out_port)
     sockaddr_in stun_addr = *(sockaddr_in*)stun_res->ai_addr;
     freeaddrinfo(stun_res);
 
-    // --- FIX: Build a full 28-byte request with FINGERPRINT ---
-    char req[28] = { 0 };
-    // Header (20 bytes)
+    // --- FIX: Build a simple 20-byte RFC 3489 request ---
+    char req[20] = { 0 };
     *(unsigned short*)req = htons(0x0001); // Message Type: Binding Request
-    *(unsigned short*)(req + 2) = htons(8); // Message Length: 8 bytes for FINGERPRINT attribute
-    *(unsigned int*)(req + 4) = htonl(0x2112A442); // Magic Cookie
+    *(unsigned short*)(req + 2) = 0;       // Message Length: 0 (no attributes)
 
+    // Transaction ID (16 bytes for legacy STUN)
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<unsigned int> dis;
-    for (int i = 0; i < 3; ++i) {
-        *(unsigned int*)(req + 8 + i * 4) = dis(gen); // Transaction ID
+    for (int i = 0; i < 4; ++i) {
+        *(unsigned int*)(req + 4 + i * 4) = dis(gen);
     }
-
-    // FINGERPRINT Attribute (8 bytes)
-    *(unsigned short*)(req + 20) = htons(0x8028); // Attribute Type: FINGERPRINT
-    *(unsigned short*)(req + 22) = htons(4);      // Attribute Length: 4 bytes
-    
-    // Calculate CRC32 over the first 24 bytes (header + attribute header)
-    uint32_t crc = crc32(req, 24);
-    *(unsigned int*)(req + 24) = htonl(crc ^ 0x5354554e); // XOR with magic number
 
     sendto(sock, req, sizeof(req), 0, (const sockaddr*)&stun_addr, sizeof(stun_addr));
 
@@ -107,18 +86,19 @@ bool GetPublicEndpoint(const Config& config, std::string& out_ip, int& out_port)
 
     if (bytes <= 0) return false;
 
+    // Check for legacy response type
     if (!((buffer[0] == 0x01) && (buffer[1] == 0x01))) return false;
+    
     const char* p = buffer + 20;
     while (p < buffer + bytes) {
         unsigned short type = ntohs(*(unsigned short*)p);
         unsigned short len = ntohs(*(unsigned short*)(p + 2));
-        if (type == 0x0020) {
+        // Look for MAPPED-ADDRESS (0x0001)
+        if (type == 0x0001) {
             unsigned short port = ntohs(*(unsigned short*)(p + 6));
-            unsigned int ip = ntohl(*(unsigned int*)(p + 8));
-            port ^= (ntohl(0x2112A442) >> 16);
-            ip ^= ntohl(0x2112A442);
             
-            in_addr addr = { htonl(ip) };
+            in_addr addr;
+            addr.s_addr = *(unsigned int*)(p + 8); // IP is in network byte order
             out_ip = inet_ntoa(addr);
             out_port = port;
             return true;
@@ -154,10 +134,10 @@ void TcpHolePunchingThread(Config config, bool is_listener, const std::string& p
         std::cout << "\n--- 开始新一轮穿透尝试 ---" << std::endl;
 
         SetColor(CYAN);
-        std::cout << "[步骤 1] 正在通过 STUN 服务器发现公网地址..." << std::endl;
+        std::cout << "[步骤 1] 正在通过 STUN 服务器发现公网地址 (兼容模式)..." << std::endl;
         std::string my_public_ip;
         int my_public_port;
-        if (GetPublicEndpoint(config, my_public_ip, my_public_port)) {
+        if (GetPublicEndpoint_Legacy(config, my_public_ip, my_public_port)) {
             SetColor(LIGHT_GREEN);
             std::cout << "[成功] 我的公网地址是: " << my_public_ip << ":" << my_public_port << std::endl;
             if (is_listener) {
@@ -284,30 +264,4 @@ int main(int argc, char* argv[]) {
         std::cout << "用法说明:\n";
         std::cout << "  作为监听方:  forwarder.exe listen\n";
         std::cout << "  作为连接方:  forwarder.exe connect <监听方的公网IP:端口>\n";
-        WSACleanup();
-        return 1;
-    }
-
-    bool is_listener = (strcmp(argv[1], "listen") == 0);
-    std::string peer_addr_str = "";
-    if (!is_listener) {
-        if (argc < 3) {
-            SetColor(RED);
-            std::cerr << "错误: 连接方模式需要提供对端的公网地址。" << std::endl;
-            return 1;
-        }
-        peer_addr_str = argv[2];
-    }
-
-    char exePath[MAX_PATH];
-    GetModuleFileNameA(NULL, exePath, MAX_PATH);
-    PathRemoveFileSpecA(exePath);
-    std::string iniPath = std::string(exePath) + "\\config.ini";
-    
-    Config config = ReadIniConfig(iniPath);
-
-    TcpHolePunchingThread(config, is_listener, peer_addr_str);
-
-    WSACleanup();
-    return 0;
-}
+        WSACL
