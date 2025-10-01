@@ -57,15 +57,13 @@ bool RecvAll(SOCKET sock, char* buffer, int len) {
     int total_received = 0;
     while (total_received < len) {
         int bytes = recv(sock, buffer + total_received, len - total_received, 0);
-        if (bytes <= 0) {
-            return false; // 连接关闭或出错
-        }
+        if (bytes <= 0) return false;
         total_received += bytes;
     }
     return true;
 }
 
-// --- STUN 客户端 (STUN over TCP 模式 - 已修复TCP流读取逻辑) ---
+// --- STUN 客户端 (STUN over TCP 模式 - 已修复连接逻辑) ---
 bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_port) {
     SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     
@@ -73,32 +71,22 @@ bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_p
     getaddrinfo(config.stun_server_host.c_str(), std::to_string(config.stun_server_port).c_str(), nullptr, &stun_res);
     if (!stun_res) { closesocket(sock); return false; }
     
-    u_long mode = 1;
-    ioctlsocket(sock, FIONBIO, &mode);
-    connect(sock, stun_res->ai_addr, (int)stun_res->ai_addrlen);
-    
-    fd_set write_set;
-    FD_ZERO(&write_set);
-    FD_SET(sock, &write_set);
-    timeval timeout = { 3, 0 };
-    
-    bool connected = false;
-    if (select(0, NULL, &write_set, NULL, &timeout) > 0) {
-        int opt_val;
-        int opt_len = sizeof(opt_val);
-        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&opt_val, &opt_len) == 0 && opt_val == 0) {
-            connected = true;
-        }
-    }
-    
-    freeaddrinfo(stun_res);
-    mode = 0;
-    ioctlsocket(sock, FIONBIO, &mode);
+    // --- FIX: Use a simpler, more robust connect-with-timeout method ---
+    DWORD timeout_ms = 3000;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms));
 
-    if (!connected) {
+    SetColor(GRAY);
+    std::cout << "[调试] 正在尝试 TCP 连接至 " << config.stun_server_host << ":" << config.stun_server_port << "..." << std::endl;
+    if (connect(sock, stun_res->ai_addr, (int)stun_res->ai_addrlen) == SOCKET_ERROR) {
+        SetColor(RED);
+        std::cerr << "[调试] TCP 连接失败。错误码: " << WSAGetLastError() << std::endl;
+        freeaddrinfo(stun_res);
         closesocket(sock);
         return false;
     }
+    freeaddrinfo(stun_res);
+    SetColor(GREEN);
+    std::cout << "[调试] TCP 连接成功。" << std::endl;
 
     char req[20] = { 0 };
     *(unsigned short*)req = htons(0x0001);
@@ -116,45 +104,45 @@ bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_p
         closesocket(sock);
         return false;
     }
+    SetColor(GRAY);
+    std::cout << "[调试] STUN 请求已发送。" << std::endl;
 
-    // --- FIX: Robust two-stage TCP stream reading ---
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms));
     
-    // Stage 1: Read exactly 20 bytes for the header
     char header_buffer[20];
     if (!RecvAll(sock, header_buffer, 20)) {
+        SetColor(RED);
+        std::cerr << "[调试] 读取 STUN 响应头失败。" << std::endl;
         closesocket(sock);
         return false;
     }
 
-    // Stage 2: Parse message length and read the rest of the message
     unsigned short msg_len = ntohs(*(unsigned short*)(header_buffer + 2));
-    if (msg_len > 1400) { // Sanity check
-        closesocket(sock);
-        return false;
-    }
+    if (msg_len > 1400) { closesocket(sock); return false; }
 
     std::vector<char> attr_buffer(msg_len);
     if (msg_len > 0 && !RecvAll(sock, attr_buffer.data(), msg_len)) {
+        SetColor(RED);
+        std::cerr << "[调试] 读取 STUN 响应体失败。" << std::endl;
         closesocket(sock);
         return false;
     }
-    closesocket(sock); // We have the full message, close the socket
+    closesocket(sock);
+    SetColor(GREEN);
+    std::cout << "[调试] 成功接收并关闭 STUN 连接。" << std::endl;
 
-    // Combine header and attributes into one buffer for parsing
     std::vector<char> full_message(20 + msg_len);
     memcpy(full_message.data(), header_buffer, 20);
     if (msg_len > 0) {
         memcpy(full_message.data() + 20, attr_buffer.data(), msg_len);
     }
 
-    // Parse the complete response
     if (!((full_message[0] == 0x01) && (full_message[1] == 0x01))) return false;
     const char* p = full_message.data() + 20;
     while (p < full_message.data() + full_message.size()) {
         unsigned short type = ntohs(*(unsigned short*)p);
         unsigned short len = ntohs(*(unsigned short*)(p + 2));
-        if (type == 0x0020) { // XOR-MAPPED-ADDRESS
+        if (type == 0x0020) {
             unsigned short port = ntohs(*(unsigned short*)(p + 6));
             unsigned int ip = ntohl(*(unsigned int*)(p + 8));
             port ^= (ntohl(0x2112A442) >> 16);
@@ -165,7 +153,7 @@ bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_p
             out_port = port;
             return true;
         }
-        p += (4 + (len % 4 == 0 ? len : len + (4 - len % 4))); // Attributes are 4-byte aligned
+        p += (4 + (len % 4 == 0 ? len : len + (4 - len % 4)));
     }
     return false;
 }
@@ -278,19 +266,12 @@ void TcpHolePunchingThread(Config config, bool is_listener, const std::string& p
             sockaddr_in peer_addr = { AF_INET, htons(peer_port) };
             inet_pton(AF_INET, peer_ip.c_str(), &peer_addr.sin_addr);
 
-            timeval timeout = { config.tcp_punch_timeout_ms / 1000, (config.tcp_punch_timeout_ms % 1000) * 1000 };
-            fd_set write_set;
-            FD_ZERO(&write_set);
-            FD_SET(sock, &write_set);
-            
-            mode = 1;
-            ioctlsocket(sock, FIONBIO, &mode);
-            connect(sock, (sockaddr*)&peer_addr, sizeof(peer_addr));
-            if (select(0, NULL, &write_set, NULL, &timeout) > 0) {
+            // 使用带超时的连接
+            DWORD punch_timeout = config.tcp_punch_timeout_ms;
+            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&punch_timeout, sizeof(punch_timeout));
+            if (connect(sock, (sockaddr*)&peer_addr, sizeof(peer_addr)) == 0) {
                 peer_sock = sock;
             }
-            mode = 0;
-            ioctlsocket(sock, FIONBIO, &mode);
         }
 
         if (peer_sock != INVALID_SOCKET) {
