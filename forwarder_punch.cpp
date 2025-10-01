@@ -52,55 +52,80 @@ Config ReadIniConfig(const std::string& filePath) {
     return config;
 }
 
-// --- STUN 客户端 (古老 RFC 3489 模式 + CHANGE-REQUEST) ---
-bool GetPublicEndpoint_Legacy(const Config& config, std::string& out_ip, int& out_port) {
-    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+// --- STUN 客户端 (STUN over TCP 模式) ---
+bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_port) {
+    // FIX: Create a TCP socket
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     
     addrinfo* stun_res = nullptr;
     getaddrinfo(config.stun_server_host.c_str(), std::to_string(config.stun_server_port).c_str(), nullptr, &stun_res);
     if (!stun_res) { closesocket(sock); return false; }
-    sockaddr_in stun_addr = *(sockaddr_in*)stun_res->ai_addr;
+    
+    // FIX: Establish a TCP connection with a timeout
+    u_long mode = 1;
+    ioctlsocket(sock, FIONBIO, &mode); // Set non-blocking for connect timeout
+    connect(sock, stun_res->ai_addr, (int)stun_res->ai_addrlen);
+    
+    fd_set write_set;
+    FD_ZERO(&write_set);
+    FD_SET(sock, &write_set);
+    timeval timeout = { 3, 0 };
+    
+    bool success = false;
+    if (select(0, NULL, &write_set, NULL, &timeout) > 0) {
+        int opt_val;
+        int opt_len = sizeof(opt_val);
+        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&opt_val, &opt_len) == 0 && opt_val == 0) {
+            success = true;
+        }
+    }
+    
     freeaddrinfo(stun_res);
+    mode = 0;
+    ioctlsocket(sock, FIONBIO, &mode); // Restore blocking mode
 
-    // --- FIX: Build a 28-byte request including the CHANGE-REQUEST attribute ---
-    char req[28] = { 0 };
-    // Header (20 bytes)
-    *(unsigned short*)req = htons(0x0001); // Message Type: Binding Request
-    *(unsigned short*)(req + 2) = htons(8); // Message Length: 8 bytes for one attribute
+    if (!success) {
+        closesocket(sock);
+        return false;
+    }
+
+    // FIX: Build a modern 20-byte STUN request (as seen in Wireshark)
+    char req[20] = { 0 };
+    *(unsigned short*)req = htons(0x0001);         // Message Type: Binding Request
+    *(unsigned short*)(req + 2) = 0;               // Message Length: 0 (no attributes)
+    *(unsigned int*)(req + 4) = htonl(0x2112A442); // Magic Cookie
 
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<unsigned int> dis;
-    for (int i = 0; i < 4; ++i) {
-        *(unsigned int*)(req + 4 + i * 4) = dis(gen); // 16-byte Transaction ID
+    for (int i = 0; i < 3; ++i) {
+        *(unsigned int*)(req + 8 + i * 4) = dis(gen); // 12-byte Transaction ID
     }
 
-    // Attribute (8 bytes)
-    *(unsigned short*)(req + 20) = htons(0x0003); // Attribute Type: CHANGE-REQUEST
-    *(unsigned short*)(req + 22) = htons(4);      // Attribute Length: 4 bytes
-    *(unsigned int*)(req + 24) = 0;               // Value: 0 (no change requested)
+    // FIX: Send request over the established TCP stream
+    send(sock, req, sizeof(req), 0);
 
-    sendto(sock, req, sizeof(req), 0, (const sockaddr*)&stun_addr, sizeof(stun_addr));
-
-    timeval timeout = { 3, 0 };
+    // FIX: Receive response from the same TCP stream
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char*)&timeout, sizeof(timeout));
-
     char buffer[1500];
-    int bytes = recvfrom(sock, buffer, sizeof(buffer), 0, NULL, NULL);
+    int bytes = recv(sock, buffer, sizeof(buffer), 0);
     closesocket(sock);
 
     if (bytes <= 0) return false;
 
+    // Parse the response (modern STUN with XOR-MAPPED-ADDRESS)
     if (!((buffer[0] == 0x01) && (buffer[1] == 0x01))) return false;
-    
     const char* p = buffer + 20;
     while (p < buffer + bytes) {
         unsigned short type = ntohs(*(unsigned short*)p);
         unsigned short len = ntohs(*(unsigned short*)(p + 2));
-        if (type == 0x0001) { // MAPPED-ADDRESS
+        if (type == 0x0020) { // XOR-MAPPED-ADDRESS
             unsigned short port = ntohs(*(unsigned short*)(p + 6));
-            in_addr addr;
-            addr.s_addr = *(unsigned int*)(p + 8);
+            unsigned int ip = ntohl(*(unsigned int*)(p + 8));
+            port ^= (ntohl(0x2112A442) >> 16);
+            ip ^= ntohl(0x2112A442);
+            
+            in_addr addr = { htonl(ip) };
             out_ip = inet_ntoa(addr);
             out_port = port;
             return true;
@@ -136,12 +161,12 @@ void TcpHolePunchingThread(Config config, bool is_listener, const std::string& p
         std::cout << "\n--- 开始新一轮穿透尝试 ---" << std::endl;
 
         SetColor(CYAN);
-        std::cout << "[步骤 1] 正在通过 STUN 服务器发现公网地址 (兼容模式)..." << std::endl;
+        std::cout << "[步骤 1] 正在通过 STUN/TCP 发现公网地址..." << std::endl;
         std::string my_public_ip;
         int my_public_port;
-        if (!GetPublicEndpoint_Legacy(config, my_public_ip, my_public_port)) {
+        if (!GetPublicEndpoint_TCP(config, my_public_ip, my_public_port)) {
             SetColor(RED);
-            std::cerr << "[失败] STUN 请求超时或失败。请检查服务器地址或网络连接。" << std::endl;
+            std::cerr << "[失败] STUN/TCP 请求超时或失败。请检查服务器地址或网络连接。" << std::endl;
             if (config.tcp_auto_retry) {
                 SetColor(YELLOW);
                 std::cout << "[准备重试] 等待 " << config.tcp_retry_interval_ms << " 毫秒后将自动重试..." << std::endl;
