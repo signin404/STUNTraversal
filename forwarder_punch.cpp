@@ -63,7 +63,7 @@ bool RecvAll(SOCKET sock, char* buffer, int len) {
     return true;
 }
 
-// --- STUN 客户端 (STUN over TCP 模式 - 已修复连接逻辑) ---
+// --- STUN 客户端 (STUN over TCP 模式) ---
 bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_port) {
     SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     
@@ -71,22 +71,15 @@ bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_p
     getaddrinfo(config.stun_server_host.c_str(), std::to_string(config.stun_server_port).c_str(), nullptr, &stun_res);
     if (!stun_res) { closesocket(sock); return false; }
     
-    // --- FIX: Use a simpler, more robust connect-with-timeout method ---
     DWORD timeout_ms = 3000;
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms));
 
-    SetColor(GRAY);
-    std::cout << "[调试] 正在尝试 TCP 连接至 " << config.stun_server_host << ":" << config.stun_server_port << "..." << std::endl;
     if (connect(sock, stun_res->ai_addr, (int)stun_res->ai_addrlen) == SOCKET_ERROR) {
-        SetColor(RED);
-        std::cerr << "[调试] TCP 连接失败。错误码: " << WSAGetLastError() << std::endl;
         freeaddrinfo(stun_res);
         closesocket(sock);
         return false;
     }
     freeaddrinfo(stun_res);
-    SetColor(GREEN);
-    std::cout << "[调试] TCP 连接成功。" << std::endl;
 
     char req[20] = { 0 };
     *(unsigned short*)req = htons(0x0001);
@@ -104,15 +97,11 @@ bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_p
         closesocket(sock);
         return false;
     }
-    SetColor(GRAY);
-    std::cout << "[调试] STUN 请求已发送。" << std::endl;
 
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms));
     
     char header_buffer[20];
     if (!RecvAll(sock, header_buffer, 20)) {
-        SetColor(RED);
-        std::cerr << "[调试] 读取 STUN 响应头失败。" << std::endl;
         closesocket(sock);
         return false;
     }
@@ -122,14 +111,10 @@ bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_p
 
     std::vector<char> attr_buffer(msg_len);
     if (msg_len > 0 && !RecvAll(sock, attr_buffer.data(), msg_len)) {
-        SetColor(RED);
-        std::cerr << "[调试] 读取 STUN 响应体失败。" << std::endl;
         closesocket(sock);
         return false;
     }
     closesocket(sock);
-    SetColor(GREEN);
-    std::cout << "[调试] 成功接收并关闭 STUN 连接。" << std::endl;
 
     std::vector<char> full_message(20 + msg_len);
     memcpy(full_message.data(), header_buffer, 20);
@@ -177,7 +162,7 @@ void TcpProxy(SOCKET s1, SOCKET s2, int keep_alive_ms) {
     closesocket(s2);
 }
 
-// --- TCP 打洞主逻辑 ---
+// --- TCP 打洞主逻辑 (已重构，使用双套接字模型) ---
 void TcpHolePunchingThread(Config config, bool is_listener, const std::string& peer_addr_str) {
     do {
         SetColor(WHITE);
@@ -207,18 +192,18 @@ void TcpHolePunchingThread(Config config, bool is_listener, const std::string& p
             std::cout << "[操作] 请将此地址发送给连接方。" << std::endl;
         }
 
-        SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        // --- FIX: Create the main socket for listening or connecting ---
+        SOCKET main_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         BOOL reuse = TRUE;
-        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+        setsockopt(main_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
         
         sockaddr_in local_addr = { AF_INET, htons(config.tcp_local_listen_port), {INADDR_ANY} };
-        if (bind(sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR) {
+        if (bind(main_sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR) {
             SetColor(RED);
             std::cerr << "[错误] 无法绑定本地端口 " << config.tcp_local_listen_port << "。该端口可能已被占用。" << std::endl;
-            closesocket(sock);
+            closesocket(main_sock);
+            // ... (retry logic)
             if (config.tcp_auto_retry) {
-                SetColor(YELLOW);
-                std::cout << "[准备重试] 等待 " << config.tcp_retry_interval_ms << " 毫秒后将自动重试..." << std::endl;
                 std::this_thread::sleep_for(std::chrono::milliseconds(config.tcp_retry_interval_ms));
                 continue;
             } else {
@@ -227,19 +212,29 @@ void TcpHolePunchingThread(Config config, bool is_listener, const std::string& p
         }
 
         SetColor(CYAN);
-        std::cout << "[步骤 2] 套接字已成功绑定至本地端口 " << config.tcp_local_listen_port << "。" << std::endl;
+        std::cout << "[步骤 2] 主套接字已成功绑定至本地端口 " << config.tcp_local_listen_port << "。" << std::endl;
 
+        // If listener, put the main socket into listening state BEFORE priming
+        if (is_listener) {
+            listen(main_sock, 1);
+        }
+
+        // --- FIX: Use a separate, temporary socket for priming the NAT ---
         SetColor(CYAN);
         std::cout << "[步骤 3] 正在通过连接 '" << config.tcp_priming_host << "' 来预热 NAT..." << std::endl;
+        SOCKET prime_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        setsockopt(prime_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+        bind(prime_sock, (sockaddr*)&local_addr, sizeof(local_addr)); // Bind to the same local port
+
         addrinfo* prime_res = nullptr;
         getaddrinfo(config.tcp_priming_host.c_str(), "80", nullptr, &prime_res);
+        // We don't care if this connect succeeds, just send the SYN packet
         u_long mode = 1;
-        ioctlsocket(sock, FIONBIO, &mode);
-        connect(sock, prime_res->ai_addr, (int)prime_res->ai_addrlen);
+        ioctlsocket(prime_sock, FIONBIO, &mode);
+        connect(prime_sock, prime_res->ai_addr, (int)prime_res->ai_addrlen);
         freeaddrinfo(prime_res);
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        mode = 0;
-        ioctlsocket(sock, FIONBIO, &mode);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200)); // Give it time to send
+        closesocket(prime_sock); // The priming socket's job is done
         SetColor(GREEN);
         std::cout << "[成功] NAT 预热包已发送。" << std::endl;
 
@@ -247,16 +242,15 @@ void TcpHolePunchingThread(Config config, bool is_listener, const std::string& p
         if (is_listener) {
             SetColor(CYAN);
             std::cout << "[步骤 4] 正在监听等待对方连接..." << std::endl;
-            listen(sock, 1);
             
             timeval timeout = { config.tcp_punch_timeout_ms / 1000, (config.tcp_punch_timeout_ms % 1000) * 1000 };
             fd_set read_set;
             FD_ZERO(&read_set);
-            FD_SET(sock, &read_set);
+            FD_SET(main_sock, &read_set);
             if (select(0, &read_set, NULL, NULL, &timeout) > 0) {
-                peer_sock = accept(sock, NULL, NULL);
+                peer_sock = accept(main_sock, NULL, NULL);
             }
-        } else {
+        } else { // Connector
             SetColor(CYAN);
             std::cout << "[步骤 4] 正在连接对端地址 " << peer_addr_str << "..." << std::endl;
             size_t colon_pos = peer_addr_str.find(':');
@@ -266,11 +260,10 @@ void TcpHolePunchingThread(Config config, bool is_listener, const std::string& p
             sockaddr_in peer_addr = { AF_INET, htons(peer_port) };
             inet_pton(AF_INET, peer_ip.c_str(), &peer_addr.sin_addr);
 
-            // 使用带超时的连接
             DWORD punch_timeout = config.tcp_punch_timeout_ms;
-            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&punch_timeout, sizeof(punch_timeout));
-            if (connect(sock, (sockaddr*)&peer_addr, sizeof(peer_addr)) == 0) {
-                peer_sock = sock;
+            setsockopt(main_sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&punch_timeout, sizeof(punch_timeout));
+            if (connect(main_sock, (sockaddr*)&peer_addr, sizeof(peer_addr)) == 0) {
+                peer_sock = main_sock;
             }
         }
 
@@ -297,8 +290,8 @@ void TcpHolePunchingThread(Config config, bool is_listener, const std::string& p
         } else {
             SetColor(RED);
             std::cerr << "[穿透失败] TCP 打洞失败 (连接超时)。" << std::endl;
-            closesocket(sock);
         }
+        closesocket(main_sock); // Close the main socket at the end of the attempt
 
         if (config.tcp_auto_retry) {
             SetColor(YELLOW);
