@@ -42,7 +42,6 @@ Config ReadIniConfig(const std::string& filePath) {
     GetPrivateProfileStringA("TCP_HolePunch", "ForwardHost", "127.0.0.1", buffer, sizeof(buffer), filePath.c_str());
     config.forward_host = buffer;
     config.forward_port = GetPrivateProfileIntA("TCP_HolePunch", "ForwardPort", 9999, filePath.c_str());
-    // *** 关键修改：使用一个不会响应的地址作为默认打洞目标 ***
     GetPrivateProfileStringA("TCP_HolePunch", "PrimingHost", "192.0.2.1", buffer, sizeof(buffer), filePath.c_str());
     config.priming_host = buffer;
     config.keep_alive_ms = GetPrivateProfileIntA("TCP_HolePunch", "KeepAliveMS", 2300, filePath.c_str());
@@ -51,7 +50,18 @@ Config ReadIniConfig(const std::string& filePath) {
     return config;
 }
 
-// --- STUN 客户端 (无需修改) ---
+// --- 辅助函数：健壮地从TCP流中读取指定长度的数据 ---
+bool RecvAll(SOCKET sock, char* buffer, int len) {
+    int total_received = 0;
+    while (total_received < len) {
+        int bytes = recv(sock, buffer + total_received, len - total_received, 0);
+        if (bytes <= 0) return false;
+        total_received += bytes;
+    }
+    return true;
+}
+
+// --- STUN 客户端 ---
 bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_port) {
     SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock == INVALID_SOCKET) return false;
@@ -99,7 +109,7 @@ bool GetPublicEndpoint_TCP(const Config& config, std::string& out_ip, int& out_p
     return false;
 }
 
-// --- TCP 代理 (无需修改) ---
+// --- TCP 代理 ---
 void TcpProxy(SOCKET s1, SOCKET s2, int keep_alive_ms) {
     tcp_keepalive ka; ka.onoff = (u_long)1; ka.keepalivetime = keep_alive_ms; ka.keepaliveinterval = 1000;
     DWORD bytes_returned;
@@ -113,7 +123,7 @@ void TcpProxy(SOCKET s1, SOCKET s2, int keep_alive_ms) {
     closesocket(s1); closesocket(s2);
 }
 
-// --- 连接处理 (无需修改) ---
+// --- 连接处理 ---
 void HandleNewConnection(SOCKET peer_sock, Config config) {
     sockaddr_in peer_addr; int peer_addr_len = sizeof(peer_addr);
     getpeername(peer_sock, (sockaddr*)&peer_addr, &peer_addr_len);
@@ -137,7 +147,7 @@ void HandleNewConnection(SOCKET peer_sock, Config config) {
     freeaddrinfo(fwd_res);
 }
 
-// --- 单边打洞并监听的主逻辑 (已修复) ---
+// --- 单边打洞并监听的主逻辑 ---
 void PortForwardingThread(Config config) {
     do {
         SetColor(WHITE);
@@ -170,17 +180,11 @@ void PortForwardingThread(Config config) {
         addrinfo* prime_res = nullptr;
         getaddrinfo(config.priming_host.c_str(), "80", nullptr, &prime_res);
         if (prime_res) {
-            // *** 关键修改：使用带超时的阻塞 connect ***
-            // 1. 设置一个非常短的发送超时，确保 SYN 包能发出去
             DWORD timeout = 1000; // 1秒
             setsockopt(listener_sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout, sizeof(timeout));
-
-            // 2. 这个 connect 注定会因为超时而失败，但这正是我们想要的！
-            //    失败前，SYN 包已经被发出，NAT 映射已建立。
             connect(listener_sock, prime_res->ai_addr, (int)prime_res->ai_addrlen);
             freeaddrinfo(prime_res);
 
-            // 3. connect 失败后，套接字仍处于可用状态，可以安全地调用 listen
             if (listen(listener_sock, SOMAXCONN) == SOCKET_ERROR) {
                  SetColor(RED);
                  std::cerr << "[错误] 套接字 listen() 失败。错误码: " << WSAGetLastError() << std::endl;
@@ -212,7 +216,7 @@ void PortForwardingThread(Config config) {
     } while (config.auto_retry);
 }
 
-// --- 主函数 (无需修改) ---
+// --- 主函数 ---
 int main(int argc, char* argv[]) {
     SetConsoleOutputCP(65001);
     SetConsoleTitleA("TCP NAT 端口转发器");
