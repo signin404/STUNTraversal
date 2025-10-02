@@ -36,11 +36,10 @@ void SendToastNotification(const wchar_t* aumid);
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow)
 {
-    // 初始化 COM 和 WinRT
+    // ... 初始化代码不变 ...
     winrt::init_apartment();
     CoInitialize(NULL);
 
-    // 1. 创建一个标准的 Win32 窗口
     const wchar_t CLASS_NAME[] = L"InMemoryAumidSample";
     WNDCLASS wc = { };
     wc.lpfnWndProc = WindowProc;
@@ -59,20 +58,21 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
         return 0;
     }
 
-    // 2. 【核心验证】为刚刚创建的窗口句柄动态设置AUMID
-    // 这一步完全在内存中进行，不涉及任何文件或注册表写入
+    // --- 核心时序修复 ---
+    // 1. 先让窗口对系统可见
+    ShowWindow(hwnd, nCmdShow);
+    UpdateWindow(hwnd); // 确保窗口已绘制
+
+    // 2. 现在窗口已“激活”，再为它绑定AUMID
     bool success = SetAumidForWindow(hwnd, AUMID);
 
     if (success)
     {
-        // 3. 【证明有效】如果AUMID设置成功，立即尝试发送Toast通知
-        // 如果通知能够出现，就证明了这个临时的、内存中的AUMID是有效的
+        // 3. 最后，发送通知
         SendToastNotification(AUMID);
     }
     
-    ShowWindow(hwnd, nCmdShow);
-
-    // 标准消息循环
+    // ... 消息循环不变 ...
     MSG msg = { };
     while (GetMessage(&msg, NULL, 0, 0))
     {
@@ -83,6 +83,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
     CoUninitialize();
     return 0;
 }
+
+// WindowProc, SetAumidForWindow, SendToastNotification 函数保持不变
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
