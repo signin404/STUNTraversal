@@ -54,6 +54,9 @@ Settings ReadIniConfig(const std::string& filePath) {
     char buffer[4096];
 
     auto safe_stoi = [&](const std::string& s, int default_val) {
+        if (s.empty()) {
+            return default_val;
+        }
         try {
             return std::stoi(s);
         } catch (const std::invalid_argument&) {
@@ -69,6 +72,7 @@ Settings ReadIniConfig(const std::string& filePath) {
     GetPrivateProfileStringA("Settings", "TCPForwardPort", "0", buffer, sizeof(buffer), filePath.c_str());
     std::string tcp_fwd_port_str = buffer;
     std::transform(tcp_fwd_port_str.begin(), tcp_fwd_port_str.end(), tcp_fwd_port_str.begin(), ::tolower);
+    // *** FIX: Use the safe_stoi wrapper ***
     settings.tcp_forward_port = (tcp_fwd_port_str == "auto") ? -1 : safe_stoi(tcp_fwd_port_str, 0);
 
     settings.udp_listen_port = GetPrivateProfileIntA("Settings", "UDPListenPort", 0, filePath.c_str());
@@ -77,6 +81,7 @@ Settings ReadIniConfig(const std::string& filePath) {
     GetPrivateProfileStringA("Settings", "UDPForwardPort", "0", buffer, sizeof(buffer), filePath.c_str());
     std::string udp_fwd_port_str = buffer;
     std::transform(udp_fwd_port_str.begin(), udp_fwd_port_str.end(), udp_fwd_port_str.begin(), ::tolower);
+    // *** FIX: Use the safe_stoi wrapper ***
     settings.udp_forward_port = (udp_fwd_port_str == "auto") ? -1 : safe_stoi(udp_fwd_port_str, 0);
     settings.udp_session_timeout_ms = GetPrivateProfileIntA("Settings", "UDPSessionTimeoutMS", 30000, filePath.c_str());
     settings.udp_max_chunk_length = GetPrivateProfileIntA("Settings", "UDPMaxChunkLength", 1500, filePath.c_str());
@@ -425,8 +430,6 @@ void UDPPunchingThread(Settings settings) {
             }
 
             if (settings.udp_forward_host.empty()) {
-                // In punch-only mode, we still need to keep the mapping alive.
-                // A simple loop sending to the last STUN server will do.
                 while(true) {
                     std::this_thread::sleep_for(std::chrono::seconds(15));
                     char dummy = 0;
@@ -504,11 +507,27 @@ int main(int argc, char* argv[]) {
         std::cout << "正在初始化..." << std::endl;
     }
 
-    char exePath[MAX_PATH];
-    GetModuleFileNameA(NULL, exePath, MAX_PATH);
-    PathRemoveFileSpecA(exePath);
-    std::string iniPath = std::string(exePath) + "\\config.ini";
-    Settings settings = ReadIniConfig(iniPath);
+    Settings settings;
+    try {
+        char exePath[MAX_PATH];
+        GetModuleFileNameA(NULL, exePath, MAX_PATH);
+        PathRemoveFileSpecA(exePath);
+        std::string iniPath = std::string(exePath) + "\\config.ini";
+        settings = ReadIniConfig(iniPath);
+    } catch (const std::exception& e) {
+        std::lock_guard<std::mutex> lock(g_console_mutex);
+        SetColor(RED);
+        std::cerr << "[致命错误] 读取或解析配置文件时发生异常: " << e.what() << std::endl;
+        system("pause");
+        return 1;
+    } catch (...) {
+        std::lock_guard<std::mutex> lock(g_console_mutex);
+        SetColor(RED);
+        std::cerr << "[致命错误] 读取或解析配置文件时发生未知异常。" << std::endl;
+        system("pause");
+        return 1;
+    }
+
 
     {
         std::lock_guard<std::mutex> lock(g_console_mutex);
@@ -546,7 +565,6 @@ int main(int argc, char* argv[]) {
         std::cout << "[信息] UDP 穿透功能已禁用。" << std::endl;
     }
 
-    // 主线程保持存活
     while (true) {
         std::this_thread::sleep_for(std::chrono::hours(1));
     }
