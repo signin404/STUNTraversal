@@ -543,104 +543,77 @@ void UDPPunchingThread(Settings settings) {
     }
 }
 
-// --- 主函数 (诊断版本) ---
+// --- 主函数 (最终诊断版本) ---
 int main(int argc, char* argv[]) {
     SetConsoleOutputCP(65001);
     SetConsoleTitleA("TCP/UDP NAT 端口转发器");
     
     WSADATA wsaData;
-    int wsa_result = WSAStartup(MAKEWORD(2, 2), &wsaData);
-    if (wsa_result != 0) {
-        SetColor(RED);
-        std::cerr << "[致命错误] WSAStartup 失败, 错误代码: " << wsa_result << std::endl;
-        system("pause");
-        return 1;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        SetColor(RED); std::cerr << "[致命错误] WSAStartup 失败" << std::endl; system("pause"); return 1;
     }
 
-    // --- 开始详细诊断 ---
     std::cout << "正在初始化..." << std::endl;
-    std::cout.flush(); // 强制刷新缓冲区，确保能看到输出
 
     Settings settings;
     try {
-        std::cout << "[诊断 1] 准备获取可执行文件路径..." << std::endl;
-        std::cout.flush();
-        char exePath[MAX_PATH] = {0}; // 初始化为0
+        char exePath[MAX_PATH];
         GetModuleFileNameA(NULL, exePath, MAX_PATH);
-        
-        std::cout << "[诊断 2] 获取到的路径是: " << exePath << std::endl;
-        std::cout.flush();
-        
         PathRemoveFileSpecA(exePath);
-        
-        std::cout << "[诊断 3] 移除文件名后的路径是: " << exePath << std::endl;
-        std::cout.flush();
-
         std::string iniPath = std::string(exePath) + "\\config.ini";
-        std::cout << "[诊断 4] 配置文件路径是: " << iniPath << std::endl;
-        std::cout.flush();
-
-        // 检查文件是否存在
-        if (PathFileExistsA(iniPath.c_str())) {
-            std::cout << "[诊断 5] 确认 config.ini 文件存在。" << std::endl;
-        } else {
-            SetColor(RED);
-            std::cout << "[诊断 5] 错误: config.ini 文件不存在于上述路径！" << std::endl;
-        }
-        std::cout.flush();
-
         settings = ReadIniConfig(iniPath);
-        std::cout << "[诊断 6] 配置文件读取函数执行完毕。" << std::endl;
-        std::cout.flush();
-
     } catch (const std::exception& e) {
-        SetColor(RED);
-        std::cerr << "[致命错误] 读取配置时发生标准异常: " << e.what() << std::endl;
-        system("pause");
-        return 1;
+        SetColor(RED); std::cerr << "[致命错误] 读取配置时发生异常: " << e.what() << std::endl; system("pause"); return 1;
     } catch (...) {
-        SetColor(RED);
-        std::cerr << "[致命错误] 读取配置时发生未知异常。" << std::endl;
-        system("pause");
-        return 1;
+        SetColor(RED); std::cerr << "[致命错误] 读取配置时发生未知异常。" << std::endl; system("pause"); return 1;
     }
-
-    std::cout << "[诊断 7] 初始化流程完成，准备启动功能模块..." << std::endl;
-    std::cout.flush();
 
     SetColor(YELLOW);
     std::cout << "--- TCP/UDP NAT 端口转发器 (高级健壮版) ---" << std::endl;
 
     if (settings.stun_servers.empty()) {
+        SetColor(RED); std::cerr << "[错误] 配置文件中 [STUN] 服务器列表为空！" << std::endl; system("pause"); return 1;
+    }
+
+    std::vector<std::thread> threads;
+
+    try {
+        if (settings.tcp_listen_port > 0) {
+            std::cout << "[信息] 准备启动 TCP 线程..." << std::endl;
+            // 使用 emplace_back 捕获可能的异常
+            threads.emplace_back(TCPPunchingThread, settings); 
+            std::cout << "[信息] TCP 线程已创建。" << std::endl;
+        } else {
+            std::cout << "[信息] TCP 穿透功能已禁用。" << std::endl;
+        }
+
+        if (settings.udp_listen_port > 0) {
+            std::cout << "[信息] 准备启动 UDP 线程..." << std::endl;
+            // 使用 emplace_back 捕获可能的异常
+            threads.emplace_back(UDPPunchingThread, settings);
+            std::cout << "[信息] UDP 线程已创建。" << std::endl;
+        } else {
+            std::cout << "[信息] UDP 穿透功能已禁用。" << std::endl;
+        }
+    } catch (const std::exception& e) {
+        // 如果线程创建失败，会在这里被捕获
         SetColor(RED);
-        std::cerr << "[错误] 配置文件中 [STUN] 服务器列表为空！程序无法运行。" << std::endl;
+        std::cerr << "[致命错误] 创建线程时发生异常: " << e.what() << std::endl;
         system("pause");
         return 1;
-    }
-
-    if (settings.tcp_listen_port > 0) {
-        std::cout << "[信息] TCP 穿透功能已启用。" << std::endl;
-        std::thread(TCPPunchingThread, settings).detach();
-    } else {
-        std::cout << "[信息] TCP 穿透功能已禁用。" << std::endl;
-    }
-
-    if (settings.udp_listen_port > 0) {
-        std::cout << "[信息] UDP 穿透功能已启用。" << std::endl;
-        std::thread(UDPPunchingThread, settings).detach();
-    } else {
-        std::cout << "[信息] UDP 穿透功能已禁用。" << std::endl;
     }
     
-    if (settings.tcp_listen_port <= 0 && settings.udp_listen_port <= 0) {
-        SetColor(RED);
-        std::cerr << "[错误] TCP 和 UDP 监听端口均未配置，程序无任务可执行。" << std::endl;
-        system("pause");
-        return 1;
+    if (threads.empty()) {
+        SetColor(RED); std::cerr << "[错误] 无任务可执行。" << std::endl; system("pause"); return 1;
     }
 
-    while (true) {
-        std::this_thread::sleep_for(std::chrono::hours(1));
+    std::cout << "[信息] 所有线程已启动，主线程进入等待状态。" << std::endl;
+
+    // 等待所有线程结束
+    for (auto& t : threads) {
+        if (t.joinable()) {
+            t.join();
+        }
     }
 
     WSACleanup();
