@@ -277,10 +277,12 @@ void TCP_PortForwardingThread(Config base_config) {
 
             auto attempt_stun = [&](StunRfc rfc) {
                 for (int i = 0; i < config.stun_retry; ++i) {
-                    SetColor(CYAN); std::cout << "[TCP] 尝试 " << host << " (RFC" << (rfc == StunRfc::RFC5780 ? "5780" : "3489") << ", 第 " << i + 1 << " 次)..." << std::endl;
+                    SetColor(CYAN); std::cout << "[TCP] 尝试 " << host << ":" << port << " (RFC" << (rfc == StunRfc::RFC5780 ? "5780" : "3489") << ", 第 " << i + 1 << " 次)..." << std::endl;
                     
                     listener_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                     stun_heartbeat_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                    if(listener_sock == INVALID_SOCKET || stun_heartbeat_sock == INVALID_SOCKET) continue;
+
                     BOOL reuse = TRUE;
                     setsockopt(listener_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
                     setsockopt(stun_heartbeat_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
@@ -369,11 +371,6 @@ struct UDPSession {
 };
 
 void UDP_PortForwardingThread(Config base_config) {
-    if (!base_config.udp_listen_port) {
-        SetColor(YELLOW); std::cout << "[UDP] UDPListenPort未设置，UDP打洞功能已禁用。" << std::endl;
-        return;
-    }
-    
     do {
         g_udp_reconnect_flag = false;
         Config config = base_config;
@@ -393,9 +390,11 @@ void UDP_PortForwardingThread(Config base_config) {
 
             auto attempt_stun = [&](StunRfc rfc) {
                 for (int i = 0; i < config.stun_retry; ++i) {
-                    SetColor(CYAN); std::cout << "[UDP] 尝试 " << host << " (RFC" << (rfc == StunRfc::RFC5780 ? "5780" : "3489") << ", 第 " << i + 1 << " 次)..." << std::endl;
+                    SetColor(CYAN); std::cout << "[UDP] 尝试 " << host << ":" << port << " (RFC" << (rfc == StunRfc::RFC5780 ? "5780" : "3489") << ", 第 " << i + 1 << " 次)..." << std::endl;
                     
                     public_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+                    if(public_sock == INVALID_SOCKET) continue;
+
                     sockaddr_in local_addr = { AF_INET, htons(*config.udp_listen_port), {INADDR_ANY} };
                     if (bind(public_sock, (sockaddr*)&local_addr, sizeof(local_addr)) != SOCKET_ERROR) {
                         addrinfo* stun_res = nullptr;
@@ -451,11 +450,10 @@ void UDP_PortForwardingThread(Config base_config) {
 
             if (activity == SOCKET_ERROR) { g_udp_reconnect_flag = true; break; }
             if (activity > 0) {
-                // 检查公网套接字
                 if (FD_ISSET(public_sock, &read_fds)) {
-                    char buffer[config.udp_max_chunk_length];
+                    std::vector<char> buffer(config.udp_max_chunk_length);
                     sockaddr_in peer_addr; int peer_addr_len = sizeof(peer_addr);
-                    int bytes = recvfrom(public_sock, buffer, sizeof(buffer), 0, (sockaddr*)&peer_addr, &peer_addr_len);
+                    int bytes = recvfrom(public_sock, buffer.data(), buffer.size(), 0, (sockaddr*)&peer_addr, &peer_addr_len);
                     if (bytes > 0) {
                         char peer_ip_str[INET_ADDRSTRLEN];
                         inet_ntop(AF_INET, &peer_addr.sin_addr, peer_ip_str, sizeof(peer_ip_str));
@@ -463,7 +461,7 @@ void UDP_PortForwardingThread(Config base_config) {
 
                         if (sessions.count(session_key)) {
                             sessions[session_key].last_activity = std::chrono::steady_clock::now();
-                            send(sessions[session_key].local_socket, buffer, bytes, 0);
+                            send(sessions[session_key].local_socket, buffer.data(), bytes, 0);
                         } else {
                             if (config.udp_forward_host) {
                                 SetColor(GREEN); std::cout << "[UDP] 来自 " << session_key << " 的新会话。" << std::endl;
@@ -472,26 +470,25 @@ void UDP_PortForwardingThread(Config base_config) {
                                 getaddrinfo(config.udp_forward_host->c_str(), std::to_string(*config.udp_forward_port).c_str(), nullptr, &fwd_res);
                                 connect(local_sock, fwd_res->ai_addr, (int)fwd_res->ai_addrlen);
                                 freeaddrinfo(fwd_res);
-                                send(local_sock, buffer, bytes, 0);
+                                send(local_sock, buffer.data(), bytes, 0);
                                 sessions[session_key] = { local_sock, peer_addr, std::chrono::steady_clock::now() };
-                            } else {
-                                // 仅打洞模式，丢弃
                             }
                         }
                     }
                 }
-                // 检查本地会话套接字
-                for (const auto& pair : sessions) {
-                    if (FD_ISSET(pair.second.local_socket, &read_fds)) {
-                        char buffer[config.udp_max_chunk_length];
-                        int bytes = recv(pair.second.local_socket, buffer, sizeof(buffer), 0);
+                for (auto it = sessions.begin(); it != sessions.end(); ) {
+                    if (FD_ISSET(it->second.local_socket, &read_fds)) {
+                        std::vector<char> buffer(config.udp_max_chunk_length);
+                        int bytes = recv(it->second.local_socket, buffer.data(), buffer.size(), 0);
                         if (bytes > 0) {
-                            sendto(public_sock, buffer, bytes, 0, (sockaddr*)&pair.second.peer_addr, sizeof(pair.second.peer_addr));
+                            it->second.last_activity = std::chrono::steady_clock::now();
+                            sendto(public_sock, buffer.data(), bytes, 0, (sockaddr*)&it->second.peer_addr, sizeof(it->second.peer_addr));
                         }
                     }
+                    ++it;
                 }
             }
-            // 清理超时会话
+            
             auto now = std::chrono::steady_clock::now();
             if (std::chrono::duration_cast<std::chrono::seconds>(now - last_cleanup_time).count() >= 10) {
                 for (auto it = sessions.begin(); it != sessions.end(); ) {
