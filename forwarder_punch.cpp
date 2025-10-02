@@ -37,7 +37,6 @@ void SetColor(ConsoleColor color) {
     SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), color); 
 }
 
-// 模板化的打印函数，确保线程安全
 template<typename... Args>
 void Print(ConsoleColor color, Args&&... args) {
     std::lock_guard<std::mutex> lock(g_cout_mutex);
@@ -71,15 +70,16 @@ struct Config {
     std::vector<std::string> stun_servers;
     std::optional<int> tcp_listen_port;
     std::optional<std::string> tcp_forward_host;
-    std::optional<int> tcp_forward_port; // 0 for auto
+    std::optional<int> tcp_forward_port;
     std::optional<int> udp_listen_port;
     std::optional<std::string> udp_forward_host;
-    std::optional<int> udp_forward_port; // 0 for auto
+    std::optional<int> udp_forward_port;
     int punch_timeout_ms = 3000;
     int keep_alive_ms = 2300;
     int retry_interval_ms = 3000;
     bool auto_retry = true;
     int stun_retry = 3;
+    int stun_retry_delay_ms = 200;
     int udp_session_timeout_ms = 30000;
     int udp_max_chunk_length = 1500;
 };
@@ -123,6 +123,7 @@ Config ReadIniConfig(const std::string& filePath) {
                     else if (key == "retryintervalms") config.retry_interval_ms = std::stoi(value);
                     else if (key == "autoretry") config.auto_retry = (std::stoi(value) == 1);
                     else if (key == "stunretry") config.stun_retry = std::stoi(value);
+                    else if (key == "stunretrydelayms") config.stun_retry_delay_ms = std::stoi(value);
                     else if (key == "udpsessiontimeoutms") config.udp_session_timeout_ms = std::stoi(value);
                     else if (key == "udpmaxchunklength") config.udp_max_chunk_length = std::stoi(value);
                 } catch (const std::exception&) { /* ignore bad values */ }
@@ -136,39 +137,15 @@ Config ReadIniConfig(const std::string& filePath) {
 // STUN 核心逻辑
 // =================================================================================
 
-bool GetPublicEndpoint(SOCKET sock, StunRfc rfc, int timeout_ms, std::string& out_ip, int& out_port) {
-    char req[20] = { 0 };
-    *(unsigned short*)req = htons(0x0001);
-    *(unsigned short*)(req + 2) = 0;
-
-    std::random_device rd;
-    unsigned int seed = rd();
-    std::mt19937 gen(seed);
-    std::uniform_int_distribution<unsigned int> dis;
-
-    if (rfc == StunRfc::RFC5780) {
-        *(unsigned int*)(req + 4) = htonl(0x2112A442);
-    }
-    for (int i = 0; i < 3; ++i) {
-        *(unsigned int*)(req + 8 + i * 4) = dis(gen);
-    }
-
-    if (send(sock, req, sizeof(req), 0) == SOCKET_ERROR) return false;
-
-    char header_buffer[20];
-    if (!RecvAll(sock, header_buffer, 20, timeout_ms)) return false;
-
+bool ParseStunResponse(char* response_buffer, int response_len, StunRfc rfc, std::string& out_ip, int& out_port) {
+    const char* header_buffer = response_buffer;
     if (ntohs(*(unsigned short*)header_buffer) != 0x0101) return false;
-
     if (rfc == StunRfc::RFC5780 && *(unsigned int*)(header_buffer + 4) != htonl(0x2112A442)) return false;
 
     unsigned short msg_len = ntohs(*(unsigned short*)(header_buffer + 2));
-    if (msg_len > 1400) return false;
+    if (msg_len > response_len - 20) return false;
 
-    std::vector<char> attr_buffer(msg_len);
-    if (msg_len > 0 && !RecvAll(sock, attr_buffer.data(), msg_len, timeout_ms)) return false;
-
-    const char* p = attr_buffer.data();
+    const char* p = header_buffer + 20;
     const char* end = p + msg_len;
     while (p < end) {
         unsigned short type = ntohs(*(unsigned short*)p);
@@ -176,7 +153,7 @@ bool GetPublicEndpoint(SOCKET sock, StunRfc rfc, int timeout_ms, std::string& ou
         const char* attr_value = p + 4;
         bool found = false;
 
-        if (rfc == StunRfc::RFC5780 && type == 0x0020) { // XOR-MAPPED-ADDRESS
+        if (rfc == StunRfc::RFC5780 && type == 0x0020) {
             unsigned short port_net = *(unsigned short*)(attr_value + 2);
             unsigned int ip_net = *(unsigned int*)(attr_value + 4);
             unsigned short real_port_net = port_net ^ htons(0x2112);
@@ -187,7 +164,7 @@ bool GetPublicEndpoint(SOCKET sock, StunRfc rfc, int timeout_ms, std::string& ou
             if (inet_ntop(AF_INET, &addr, ip_str, INET_ADDRSTRLEN) != NULL) {
                 out_ip = ip_str; found = true;
             }
-        } else if (rfc == StunRfc::RFC3489 && type == 0x0001) { // MAPPED-ADDRESS
+        } else if (rfc == StunRfc::RFC3489 && type == 0x0001) {
             out_port = ntohs(*(unsigned short*)(attr_value + 2));
             in_addr addr; addr.s_addr = *(unsigned int*)(attr_value + 4);
             char ip_str[INET_ADDRSTRLEN];
@@ -240,26 +217,59 @@ void TCP_HandleNewConnection(SOCKET peer_sock, Config config) {
     freeaddrinfo(fwd_res);
 }
 
-void TCP_StunCheckThread(SOCKET sock, std::string initial_ip, int initial_port, const Config& config) {
+void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config& config) {
     while (!g_tcp_reconnect_flag) {
         std::this_thread::sleep_for(std::chrono::minutes(5));
         if (g_tcp_reconnect_flag) break;
 
         Print(CYAN, "\n[TCP] 监控: 正在检查公网地址...");
+        
+        // 使用第一个 STUN 服务器进行检查
+        const auto& server_str = config.stun_servers[0];
+        size_t colon_pos = server_str.find(':');
+        if (colon_pos == std::string::npos) { g_tcp_reconnect_flag = true; break; }
+        std::string host = server_str.substr(0, colon_pos);
+        int port = std::stoi(server_str.substr(colon_pos + 1));
+
+        SOCKET check_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (check_sock == INVALID_SOCKET) { g_tcp_reconnect_flag = true; break; }
+
+        addrinfo* stun_res = nullptr;
+        bool check_success = false;
         std::string current_ip; int current_port;
-        if (GetPublicEndpoint(sock, StunRfc::RFC5780, config.punch_timeout_ms, current_ip, current_port)) {
+
+        if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), nullptr, &stun_res) == 0) {
+            if (connect(check_sock, stun_res->ai_addr, (int)stun_res->ai_addrlen) == 0) {
+                char req[20] = {0}; // Build RFC5780 request
+                *(unsigned short*)req = htons(0x0001); *(unsigned int*)(req + 4) = htonl(0x2112A442);
+                std::random_device rd; std::mt19937 gen(rd()); std::uniform_int_distribution<unsigned int> dis;
+                for (int i = 0; i < 3; ++i) *(unsigned int*)(req + 8 + i * 4) = dis(gen);
+                
+                if (send(check_sock, req, sizeof(req), 0) != SOCKET_ERROR) {
+                    char response_buffer[512];
+                    int bytes = recv(check_sock, response_buffer, sizeof(response_buffer), 0);
+                    if (bytes > 20) {
+                        if (ParseStunResponse(response_buffer, bytes, StunRfc::RFC5780, current_ip, current_port)) {
+                            check_success = true;
+                        }
+                    }
+                }
+            }
+            freeaddrinfo(stun_res);
+        }
+        closesocket(check_sock);
+
+        if (check_success) {
             if (current_ip != initial_ip || current_port != initial_port) {
                 Print(YELLOW, "[TCP] 监控: 公网地址已变化！");
                 Print(YELLOW, "       旧: ", initial_ip, ":", initial_port, " -> 新: ", current_ip, ":", current_port);
                 g_tcp_reconnect_flag = true;
-                break;
             } else {
                 Print(GREEN, "[TCP] 监控: 公网地址未变化。");
             }
         } else {
             Print(RED, "[TCP] 监控: STUN检查失败，连接可能已断开。");
             g_tcp_reconnect_flag = true;
-            break;
         }
     }
 }
@@ -294,15 +304,28 @@ void TCP_PortForwardingThread(Config base_config) {
                     setsockopt(stun_heartbeat_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
                     sockaddr_in local_addr = { AF_INET, htons(*config.tcp_listen_port), {INADDR_ANY} };
 
-                    if (bind(listener_sock, (sockaddr*)&local_addr, sizeof(local_addr)) != SOCKET_ERROR &&
-                        bind(stun_heartbeat_sock, (sockaddr*)&local_addr, sizeof(local_addr)) != SOCKET_ERROR &&
-                        listen(listener_sock, SOMAXCONN) != SOCKET_ERROR) {
-                        
+                    if (bind(listener_sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR ||
+                        bind(stun_heartbeat_sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR ||
+                        listen(listener_sock, SOMAXCONN) == SOCKET_ERROR) {
+                        // Bind or listen failed
+                    } else {
                         addrinfo* stun_res = nullptr;
                         if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), nullptr, &stun_res) == 0) {
                             if (connect(stun_heartbeat_sock, stun_res->ai_addr, (int)stun_res->ai_addrlen) == 0) {
-                                if (GetPublicEndpoint(stun_heartbeat_sock, rfc, config.punch_timeout_ms, public_ip, public_port)) {
-                                    stun_success = true;
+                                char req[20] = {0}; // Build request
+                                *(unsigned short*)req = htons(0x0001);
+                                if(rfc == StunRfc::RFC5780) *(unsigned int*)(req + 4) = htonl(0x2112A442);
+                                std::random_device rd; std::mt19937 gen(rd()); std::uniform_int_distribution<unsigned int> dis;
+                                for (int k = 0; k < 3; ++k) *(unsigned int*)(req + 8 + k * 4) = dis(gen);
+                                
+                                if (send(stun_heartbeat_sock, req, sizeof(req), 0) != SOCKET_ERROR) {
+                                    char response_buffer[512];
+                                    int bytes = recv(stun_heartbeat_sock, response_buffer, sizeof(response_buffer), 0);
+                                    if (bytes > 20) {
+                                        if (ParseStunResponse(response_buffer, bytes, rfc, public_ip, public_port)) {
+                                            stun_success = true;
+                                        }
+                                    }
                                 }
                             }
                             freeaddrinfo(stun_res);
@@ -310,7 +333,7 @@ void TCP_PortForwardingThread(Config base_config) {
                     }
                     if (stun_success) return;
                     closesocket(listener_sock); closesocket(stun_heartbeat_sock);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(config.stun_retry_delay_ms));
                 }
             };
 
@@ -338,7 +361,7 @@ void TCP_PortForwardingThread(Config base_config) {
         WSAIoctl(stun_heartbeat_sock, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), NULL, 0, &bytes_returned, NULL, NULL);
         Print(LIGHT_GREEN, "[TCP] 成功！公网端口 ", public_ip, ":", public_port, " 已开启并监听。");
         
-        std::thread(TCP_StunCheckThread, stun_heartbeat_sock, public_ip, public_port, config).detach();
+        std::thread(TCP_StunCheckThread, public_ip, public_port, config).detach();
 
         while (!g_tcp_reconnect_flag) {
             fd_set read_fds; FD_ZERO(&read_fds); FD_SET(listener_sock, &read_fds);
@@ -404,16 +427,30 @@ void UDP_PortForwardingThread(Config base_config) {
                     if (bind(public_sock, (sockaddr*)&local_addr, sizeof(local_addr)) != SOCKET_ERROR) {
                         addrinfo* stun_res = nullptr;
                         if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), nullptr, &stun_res) == 0) {
-                            connect(public_sock, stun_res->ai_addr, (int)stun_res->ai_addrlen);
-                            if (GetPublicEndpoint(public_sock, rfc, config.punch_timeout_ms, public_ip, public_port)) {
-                                stun_success = true;
+                            char req[20] = {0};
+                            *(unsigned short*)req = htons(0x0001);
+                            if(rfc == StunRfc::RFC5780) *(unsigned int*)(req + 4) = htonl(0x2112A442);
+                            std::random_device rd; std::mt19937 gen(rd()); std::uniform_int_distribution<unsigned int> dis;
+                            for (int k = 0; k < 3; ++k) *(unsigned int*)(req + 8 + k * 4) = dis(gen);
+
+                            sendto(public_sock, req, sizeof(req), 0, stun_res->ai_addr, (int)stun_res->ai_addrlen);
+                            
+                            char response_buffer[512];
+                            sockaddr_in from_addr; int from_len = sizeof(from_addr);
+                            setsockopt(public_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&config.punch_timeout_ms, sizeof(config.punch_timeout_ms));
+                            int bytes = recvfrom(public_sock, response_buffer, sizeof(response_buffer), 0, (sockaddr*)&from_addr, &from_len);
+
+                            if (bytes > 20) {
+                                if (ParseStunResponse(response_buffer, bytes, rfc, public_ip, public_port)) {
+                                    stun_success = true;
+                                }
                             }
                             freeaddrinfo(stun_res);
                         }
                     }
                     if (stun_success) return;
                     closesocket(public_sock);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(config.stun_retry_delay_ms));
                 }
             };
             attempt_stun(StunRfc::RFC5780);
@@ -429,11 +466,6 @@ void UDP_PortForwardingThread(Config base_config) {
             }
             continue;
         }
-
-        // *** FIX: Disconnect UDP socket to receive from any peer ***
-        sockaddr_in disconnect_addr = {};
-        disconnect_addr.sin_family = AF_UNSPEC;
-        connect(public_sock, (sockaddr*)&disconnect_addr, sizeof(disconnect_addr));
 
         if (config.udp_forward_port == 0) {
             config.udp_forward_port = public_port;
