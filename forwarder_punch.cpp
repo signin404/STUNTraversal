@@ -731,4 +731,111 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         std::string ini_name = exe_name.substr(0, exe_name.rfind('.'));
         PathRemoveFileSpecA(exe_path_char);
         std::string iniPath = std::string(exe_path_char) + "\\" + ini_name + ".ini";
-        Config config = ReadIniConfig(iniPath
+        Config config = ReadIniConfig(iniPath);
+        ExecuteRunCommand(config);
+        return 0;
+    }
+    return DefWindowProc(hwnd, uMsg, wParam, lParam);
+}
+
+void MainLogic(const Config& config);
+
+int main(int argc, char* argv[]) {
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+
+    bool run_command_only = false;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-hide") == 0) g_is_hidden = true;
+        if (strcmp(argv[i], "-run") == 0) run_command_only = true;
+    }
+
+    char exe_path_char[MAX_PATH];
+    GetModuleFileNameA(NULL, exe_path_char, MAX_PATH);
+    std::string exe_path_str = exe_path_char;
+    std::string exe_name = exe_path_str.substr(exe_path_str.find_last_of("/\\") + 1);
+    std::string mutex_name_str = exe_name.substr(0, exe_name.rfind('.'));
+    std::wstring mutex_name(mutex_name_str.begin(), mutex_name_str.end());
+
+    HANDLE hMutex = CreateMutexW(NULL, TRUE, mutex_name.c_str());
+    if (hMutex != NULL && GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (run_command_only) {
+            HWND hExistingWnd = FindWindowW(mutex_name.c_str(), NULL);
+            if (hExistingWnd) {
+                SendMessageW(hExistingWnd, WM_APP_EXECUTE_RUN, 0, 0);
+            }
+        }
+        CloseHandle(hMutex);
+        WSACleanup();
+        return 1;
+    }
+
+    if (g_is_hidden) {
+        FreeConsole();
+    } else {
+        if (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole()) {
+            SetConsoleOutputCP(65001);
+            FILE* fDummy;
+            freopen_s(&fDummy, "CONOUT$", "w", stdout);
+            freopen_s(&fDummy, "CONOUT$", "w", stderr);
+            freopen_s(&fDummy, "CONIN$", "r", stdin);
+            std::cout.clear(); std::cin.clear(); std::cerr.clear();
+        }
+    }
+
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = WindowProc;
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.lpszClassName = mutex_name.c_str();
+    RegisterClassW(&wc);
+    g_hMessageWindow = CreateWindowExW(0, mutex_name.c_str(), L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, NULL, NULL);
+
+    PathRemoveFileSpecA(exe_path_char);
+    std::string iniPath = std::string(exe_path_char) + "\\" + mutex_name_str + ".ini";
+    Config config = ReadIniConfig(iniPath);
+    
+    std::thread main_thread(MainLogic, config);
+
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    main_thread.join();
+    ReleaseMutex(hMutex);
+    CloseHandle(hMutex);
+    DestroyWindow(g_hMessageWindow);
+    WSACleanup();
+    return 0;
+}
+
+void MainLogic(const Config& config) {
+    winrt::init_apartment();
+    
+    Print(YELLOW, "--- TCP/UDP NAT 端口转发器 (最终版) ---");
+    if (config.stun_servers.empty()) {
+        Print(RED, "错误：配置文件中未找到任何 [STUN] 服务器。");
+        return;
+    }
+
+    std::vector<std::thread> threads;
+    if (config.tcp_listen_port) {
+        threads.emplace_back(TCP_PortForwardingThread, config);
+    }
+    if (config.udp_listen_port) {
+        threads.emplace_back(UDP_PortForwardingThread, config);
+    }
+
+    if (threads.empty()) {
+        Print(RED, "错误：配置文件中未启用任何监听端口。");
+        return;
+    }
+
+    for (auto& t : threads) {
+        if (t.joinable()) t.join();
+    }
+
+    winrt::clear_factory_cache();
+    winrt::uninit_apartment();
+}
