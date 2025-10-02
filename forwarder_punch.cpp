@@ -27,7 +27,9 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "shell32.lib")
-#pragma comment(linker, "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup") // Default to WINDOWS subsystem
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "windowsapp.lib")
+#pragma comment(linker, "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup")
 
 // =================================================================================
 // 全局定义和辅助工具
@@ -42,8 +44,6 @@ std::mutex g_run_mutex;
 
 HWND g_hMessageWindow = NULL;
 UINT const WM_APP_EXECUTE_RUN = WM_APP + 1;
-UINT const WM_APP_TRAY_ICON = WM_APP + 2;
-NOTIFYICONDATAW g_nid;
 
 bool g_is_hidden = false;
 std::string g_public_ip, g_tcp_port_str, g_udp_port_str;
@@ -208,7 +208,7 @@ bool ParseStunResponse(char* response_buffer, int response_len, StunRfc rfc, std
 }
 
 // =================================================================================
-// 新增：外部程序调用和系统通知
+// 外部程序调用和系统通知
 // =================================================================================
 
 void ShowToastNotification(const std::wstring& message) {
@@ -218,14 +218,14 @@ void ShowToastNotification(const std::wstring& message) {
         winrt::Windows::UI::Notifications::ToastNotifier notifier = winrt::Windows::UI::Notifications::ToastNotificationManager::CreateToastNotifier(L"NATForwarder");
         winrt::Windows::Data::Xml::Dom::XmlDocument toastXml;
         
-        std::wstring xml_content = L"<toast><visual><binding template='ToastGeneric'><text>NAT Forwarder</text><text>";
+        std::wstring xml_content = L"<toast><visual><binding template='ToastGeneric'><text>NAT Forwarder: Public Endpoint Changed</text><text>";
         xml_content += message;
         xml_content += L"</text></binding></visual></toast>";
 
         toastXml.LoadXml(xml_content);
         winrt::Windows::UI::Notifications::ToastNotification notification(toastXml);
         notifier.Show(notification);
-    } catch (const winrt::hresult_error& e) {
+    } catch (const winrt::hresult_error&) {
         // Handle error, e.g., if notifications are disabled
     }
 }
@@ -257,10 +257,14 @@ void ExecuteRunCommand(const Config& config) {
     wchar_t absolute_path[MAX_PATH];
     GetFullPathNameW(expanded_path, MAX_PATH, absolute_path, nullptr);
 
-    std::wstring process_name = PathFindFileNameW(absolute_path);
+    wchar_t* file_part = PathFindFileNameW(absolute_path);
+    std::wstring process_name(file_part);
 
     if (!IsProcessRunning(process_name)) {
-        Print(YELLOW, "[RUN] 目标进程 ", std::string(process_name.begin(), process_name.end()), " 未运行，跳过执行。");
+        int size_needed = WideCharToMultiByte(CP_UTF8, 0, process_name.c_str(), (int)process_name.size(), NULL, 0, NULL, NULL);
+        std::string process_name_str(size_needed, 0);
+        WideCharToMultiByte(CP_UTF8, 0, process_name.c_str(), (int)process_name.size(), &process_name_str[0], size_needed, NULL, NULL);
+        Print(YELLOW, "[RUN] 目标进程 ", process_name_str, " 未运行，跳过执行。");
         return;
     }
 
@@ -279,7 +283,10 @@ void ExecuteRunCommand(const Config& config) {
     std::wstring wide_cmd(cmd.begin(), cmd.end());
     std::wstring quoted_path = L"\"" + std::wstring(absolute_path) + L"\"";
 
-    Print(GREEN, "[RUN] 正在执行: ", std::string(quoted_path.begin(), quoted_path.end()), " ", cmd);
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, quoted_path.c_str(), (int)quoted_path.size(), NULL, 0, NULL, NULL);
+    std::string quoted_path_str(size_needed, 0);
+    WideCharToMultiByte(CP_UTF8, 0, quoted_path.c_str(), (int)quoted_path.size(), &quoted_path_str[0], size_needed, NULL, NULL);
+    Print(GREEN, "[RUN] 正在执行: ", quoted_path_str, " ", cmd);
 
     SHELLEXECUTEINFOW sei = { sizeof(sei) };
     sei.fMask = SEE_MASK_NOCLOSEPROCESS;
@@ -300,6 +307,12 @@ void CheckAndExecuteRun(const Config& config, bool tcp_enabled, bool udp_enabled
 
     if (tcp_ok && udp_ok) {
         ExecuteRunCommand(config);
+        if (g_is_hidden) {
+            std::wstring msg = L"IP: " + std::wstring(g_public_ip.begin(), g_public_ip.end());
+            if (tcp_enabled) msg += L"\nTCP: " + std::wstring(g_tcp_port_str.begin(), g_tcp_port_str.end());
+            if (udp_enabled) msg += L"\nUDP: " + std::wstring(g_udp_port_str.begin(), g_udp_port_str.end());
+            ShowToastNotification(msg);
+        }
     }
 }
 
@@ -648,8 +661,7 @@ void UDP_PortForwardingThread(Config base_config) {
 
                         if (sessions.count(session_key)) {
                             sessions[session_key].last_activity = now;
-                            int sent_bytes = send(sessions[session_key].local_socket, buffer.data(), bytes, 0);
-                            // Print(WHITE, "[UDP] >> ", session_key, " (", sent_bytes, " 字节)");
+                            send(sessions[session_key].local_socket, buffer.data(), bytes, 0);
                         } else {
                             if (config.udp_forward_host && !config.udp_forward_host->empty()) {
                                 SOCKET local_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -657,7 +669,7 @@ void UDP_PortForwardingThread(Config base_config) {
                                 getaddrinfo(config.udp_forward_host->c_str(), std::to_string(*config.udp_forward_port).c_str(), nullptr, &fwd_res);
                                 connect(local_sock, fwd_res->ai_addr, (int)fwd_res->ai_addrlen);
                                 freeaddrinfo(fwd_res);
-                                int sent_bytes = send(local_sock, buffer.data(), bytes, 0);
+                                send(local_sock, buffer.data(), bytes, 0);
                                 Print(GREEN, "[UDP] 新会话 ", session_key, " ==> ", *config.udp_forward_host, ":", *config.udp_forward_port);
                                 sessions[session_key] = { local_sock, peer_addr, now };
                             } else {
@@ -672,8 +684,7 @@ void UDP_PortForwardingThread(Config base_config) {
                         int bytes = recv(it->second.local_socket, buffer.data(), buffer.size(), 0);
                         if (bytes > 0) {
                             it->second.last_activity = now;
-                            int sent_bytes = sendto(public_sock, buffer.data(), bytes, 0, (sockaddr*)&it->second.peer_addr, sizeof(it->second.peer_addr));
-                            // Print(WHITE, "[UDP] << ", it->first, " (", sent_bytes, " 字节)");
+                            sendto(public_sock, buffer.data(), bytes, 0, (sockaddr*)&it->second.peer_addr, sizeof(it->second.peer_addr));
                         }
                     }
                 }
@@ -716,8 +727,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         Print(CYAN, "[IPC] 收到 -run 命令，正在执行...");
         char exe_path_char[MAX_PATH];
         GetModuleFileNameA(NULL, exe_path_char, MAX_PATH);
+        std::string exe_path_str = exe_path_char;
+        std::string exe_name = exe_path_str.substr(exe_path_str.find_last_of("/\\") + 1);
+        std::string ini_name = exe_name.substr(0, exe_name.rfind('.'));
         PathRemoveFileSpecA(exe_path_char);
-        std::string iniPath = std::string(exe_path_char) + "\\config.ini";
+        std::string iniPath = std::string(exe_path_char) + "\\" + ini_name + ".ini";
         Config config = ReadIniConfig(iniPath);
         ExecuteRunCommand(config);
         return 0;
@@ -746,7 +760,7 @@ int main(int argc, char* argv[]) {
         if (run_command_only) {
             HWND hExistingWnd = FindWindowW(mutex_name.c_str(), NULL);
             if (hExistingWnd) {
-                SendMessage(hExistingWnd, WM_APP_EXECUTE_RUN, 0, 0);
+                SendMessageW(hExistingWnd, WM_APP_EXECUTE_RUN, 0, 0);
             }
         }
         CloseHandle(hMutex);
@@ -779,9 +793,9 @@ int main(int argc, char* argv[]) {
     std::thread main_thread(MainLogic, config);
 
     MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
+    while (GetMessageW(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
-        DispatchMessage(&msg);
+        DispatchMessageW(&msg);
     }
 
     main_thread.join();
