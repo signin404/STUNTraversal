@@ -11,6 +11,8 @@
 #include <sstream>
 #include <atomic>
 #include <mutex>
+#include <locale>
+#include <codecvt>
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -23,10 +25,6 @@
 
 #include <winrt/Windows.UI.Notifications.h>
 #include <winrt/Windows.Data.Xml.Dom.h>
-
-#include <fstream>      // 用于文件读写
-#include <codecvt>      // 用于字符串编码转换
-#include <locale>       // 用于字符串编码转换
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -264,7 +262,7 @@ bool ParseStunResponse(char* response_buffer, int response_len, StunRfc rfc, std
 // 外部程序调用和系统通知
 // =================================================================================
 
-void ShowToastNotification(const std.wstring& message) {
+void ShowToastNotification(const std::wstring& message) {
     if (!g_is_hidden) return;
 
     try {
