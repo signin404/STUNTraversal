@@ -48,44 +48,49 @@ struct Settings {
     std::vector<std::string> stun_servers;
 };
 
+// --- 新增：字符串 Trim 函数 ---
+std::string trim(const std::string& str) {
+    const std::string whitespace = " \t\n\r\f\v";
+    size_t first = str.find_first_not_of(whitespace);
+    if (std::string::npos == first) {
+        return "";
+    }
+    size_t last = str.find_last_not_of(whitespace);
+    return str.substr(first, (last - first + 1));
+}
+
 // --- INI 文件解析 (健壮版) ---
 Settings ReadIniConfig(const std::string& filePath) {
     Settings settings;
     char buffer[4096];
 
     auto safe_stoi = [&](const std::string& s, int default_val) {
-        if (s.empty()) {
-            return default_val;
-        }
+        if (s.empty()) return default_val;
         try {
             return std::stoi(s);
-        } catch (const std::invalid_argument&) {
-            return default_val;
-        } catch (const std::out_of_range&) {
+        } catch (...) {
             return default_val;
         }
     };
 
     settings.tcp_listen_port = GetPrivateProfileIntA("Settings", "TCPListenPort", 0, filePath.c_str());
     GetPrivateProfileStringA("Settings", "TCPForwardHost", "", buffer, sizeof(buffer), filePath.c_str());
-    settings.tcp_forward_host = buffer;
+    settings.tcp_forward_host = trim(buffer);
     GetPrivateProfileStringA("Settings", "TCPForwardPort", "0", buffer, sizeof(buffer), filePath.c_str());
-    std::string tcp_fwd_port_str = buffer;
+    std::string tcp_fwd_port_str = trim(buffer); // *** FIX: Trim the string first ***
     std::transform(tcp_fwd_port_str.begin(), tcp_fwd_port_str.end(), tcp_fwd_port_str.begin(), ::tolower);
-    // *** FIX: Use the safe_stoi wrapper ***
     settings.tcp_forward_port = (tcp_fwd_port_str == "auto") ? -1 : safe_stoi(tcp_fwd_port_str, 0);
 
     settings.udp_listen_port = GetPrivateProfileIntA("Settings", "UDPListenPort", 0, filePath.c_str());
     GetPrivateProfileStringA("Settings", "UDPForwardHost", "", buffer, sizeof(buffer), filePath.c_str());
-    settings.udp_forward_host = buffer;
+    settings.udp_forward_host = trim(buffer);
     GetPrivateProfileStringA("Settings", "UDPForwardPort", "0", buffer, sizeof(buffer), filePath.c_str());
-    std::string udp_fwd_port_str = buffer;
+    std::string udp_fwd_port_str = trim(buffer); // *** FIX: Trim the string first ***
     std::transform(udp_fwd_port_str.begin(), udp_fwd_port_str.end(), udp_fwd_port_str.begin(), ::tolower);
-    // *** FIX: Use the safe_stoi wrapper ***
     settings.udp_forward_port = (udp_fwd_port_str == "auto") ? -1 : safe_stoi(udp_fwd_port_str, 0);
+    
     settings.udp_session_timeout_ms = GetPrivateProfileIntA("Settings", "UDPSessionTimeoutMS", 30000, filePath.c_str());
     settings.udp_max_chunk_length = GetPrivateProfileIntA("Settings", "UDPMaxChunkLength", 1500, filePath.c_str());
-
     settings.punch_timeout_ms = GetPrivateProfileIntA("Settings", "PunchTimeoutMS", 3000, filePath.c_str());
     settings.keep_alive_ms = GetPrivateProfileIntA("Settings", "KeepAliveMS", 2300, filePath.c_str());
     settings.retry_interval_ms = GetPrivateProfileIntA("Settings", "RetryIntervalMS", 3000, filePath.c_str());
@@ -94,11 +99,13 @@ Settings ReadIniConfig(const std::string& filePath) {
 
     GetPrivateProfileSectionA("STUN", buffer, sizeof(buffer), filePath.c_str());
     for (const char* p = buffer; *p; ++p) {
-        std::string server(p);
+        std::string server = trim(p);
         size_t equals_pos = server.find('=');
-        if (equals_pos != std::string::npos) server = server.substr(0, equals_pos);
-        if (!server.empty()) settings.stun_servers.push_back(server);
-        p += server.length();
+        if (equals_pos != std::string::npos) server = trim(server.substr(0, equals_pos));
+        if (!server.empty() && server[0] != ';') {
+            settings.stun_servers.push_back(server);
+        }
+        p += strlen(p);
     }
     return settings;
 }
@@ -114,7 +121,7 @@ bool RecvAll(SOCKET sock, char* buffer, int len) {
     return true;
 }
 
-// --- 通用 STUN 客户端 ---
+// --- 通用 STUN 客户端 (已修复随机数逻辑) ---
 bool GetPublicEndpoint(const std::string& server_str, bool is_tcp, bool use_rfc5780, int local_port,
                        std::string& out_ip, int& out_port, SOCKET& out_sock, int timeout_ms) {
     size_t colon_pos = server_str.find(':');
@@ -152,7 +159,12 @@ bool GetPublicEndpoint(const std::string& server_str, bool is_tcp, bool use_rfc5
     char req[20] = { 0 };
     *(unsigned short*)req = htons(0x0001);
     *(unsigned short*)(req + 2) = 0;
-    std::random_device rd; std::mt19937 gen(rd()); std::uniform_int_distribution<unsigned int> dis;
+    
+    // *** FIX: Correctly seed the random number engine ***
+    std::random_device rd;
+    unsigned int seed = rd();
+    std::mt19937 gen(seed);
+    std::uniform_int_distribution<unsigned int> dis;
 
     if (use_rfc5780) {
         *(unsigned int*)(req + 4) = htonl(0x2112A442);
@@ -527,7 +539,6 @@ int main(int argc, char* argv[]) {
         system("pause");
         return 1;
     }
-
 
     {
         std::lock_guard<std::mutex> lock(g_console_mutex);
