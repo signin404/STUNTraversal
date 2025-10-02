@@ -302,14 +302,6 @@ void HandleNewConnection(SOCKET peer_sock, const Settings& settings, int forward
 
 // --- TCP 打洞线程 ---
 void TCPPunchingThread(const Settings& settings) {
-    // --- 决定性诊断代码 ---
-    {
-        std::lock_guard<std::mutex> lock(g_console_mutex);
-        std::cout << "[TCP THREAD] 线程已进入，准备执行代码..." << std::endl;
-        std::cout.flush(); // 强制刷新，确保能看到输出
-    }
-    // --- 结束诊断代码 ---
-
     try {
         do {
             g_tcp_reconnect_flag = false;
@@ -414,14 +406,6 @@ void TCPPunchingThread(const Settings& settings) {
 
 // --- UDP 打洞线程 ---
 void UDPPunchingThread(const Settings& settings) {
-    // --- 决定性诊断代码 ---
-    {
-        std::lock_guard<std::mutex> lock(g_console_mutex);
-        std::cout << "[UDP THREAD] 线程已进入，准备执行代码..." << std::endl;
-        std::cout.flush(); // 强制刷新，确保能看到输出
-    }
-    // --- 结束诊断代码 ---
-
     try {
         do {
             SOCKET punch_sock = INVALID_SOCKET;
