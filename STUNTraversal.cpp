@@ -513,6 +513,9 @@ void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
 // =================================================================================
 // 【改】TCP 模块 - 采用角色分离方案
 // =================================================================================
+// =================================================================================
+// 【修复】TCP 模块 - 修复保活逻辑
+// =================================================================================
 void TCP_PortForwardingThread(Config base_config) {
     winrt::init_apartment();
 
@@ -567,7 +570,7 @@ void TCP_PortForwardingThread(Config base_config) {
                         freeaddrinfo(stun_res);
                     }
                 }
-                closesocket(stun_sock); // 无论成功失败，立即关闭与 STUN 的连接
+                closesocket(stun_sock);
                 if (stun_success) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(config.stun_retry_delay_ms));
             }
@@ -639,20 +642,42 @@ void TCP_PortForwardingThread(Config base_config) {
         std::string keep_alive_packet = "HEAD / HTTP/1.1\r\nHost: " + ka_host + "\r\nConnection: keep-alive\r\n\r\n";
 
         while (!g_tcp_reconnect_flag) {
-            fd_set read_fds; FD_ZERO(&read_fds); FD_SET(listener_sock, &read_fds);
-            timeval timeout; timeout.tv_sec = 1; timeout.tv_usec = 0; // 短超时，用于轮询
-            int activity = select(0, &read_fds, NULL, NULL, &timeout);
+            fd_set read_fds; 
+            FD_ZERO(&read_fds); 
+            FD_SET(listener_sock, &read_fds);
+            FD_SET(keep_alive_sock, &read_fds); // 【新】同时监听保活Socket上的响应数据
+
+            SOCKET max_sd = max(listener_sock, keep_alive_sock);
+
+            timeval timeout; timeout.tv_sec = 1; timeout.tv_usec = 0;
+            int activity = select(max_sd + 1, &read_fds, NULL, NULL, &timeout);
 
             if (activity == SOCKET_ERROR) { g_tcp_reconnect_flag = true; break; }
-            if (activity > 0 && FD_ISSET(listener_sock, &read_fds)) {
-                SOCKET peer_sock = accept(listener_sock, NULL, NULL);
-                if (peer_sock != INVALID_SOCKET) {
-                    if (config.tcp_forward_host && !config.tcp_forward_host->empty()) {
-                        std::thread(TCP_HandleNewConnection, peer_sock, config).detach();
-                    } else {
-                        Print(CYAN, "[TCP] 接受连接并立即关闭 (仅打洞模式)。");
-                        closesocket(peer_sock);
+            
+            if (activity > 0) {
+                // 检查是否有新客户端连接
+                if (FD_ISSET(listener_sock, &read_fds)) {
+                    SOCKET peer_sock = accept(listener_sock, NULL, NULL);
+                    if (peer_sock != INVALID_SOCKET) {
+                        if (config.tcp_forward_host && !config.tcp_forward_host->empty()) {
+                            std::thread(TCP_HandleNewConnection, peer_sock, config).detach();
+                        } else {
+                            Print(CYAN, "[TCP] 接受连接并立即关闭 (仅打洞模式)。");
+                            closesocket(peer_sock);
+                        }
                     }
+                }
+
+                // 【新】检查保活服务器是否发回了响应数据
+                if (FD_ISSET(keep_alive_sock, &read_fds)) {
+                    char discard_buffer[4096];
+                    int bytes = recv(keep_alive_sock, discard_buffer, sizeof(discard_buffer), 0);
+                    if (bytes <= 0) { // 如果recv返回0或-1，说明连接已由服务器关闭
+                        Print(RED, "[TCP] 维持: 与保活服务器的连接已由对方关闭。");
+                        g_tcp_reconnect_flag = true;
+                        break;
+                    }
+                    // 成功读取并丢弃数据，什么都不用做
                 }
             }
 
