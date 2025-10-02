@@ -416,6 +416,16 @@ void UDP_PortForwardingThread(Config base_config) {
 
         Print(WHITE, "\n--- [UDP] 开始新一轮端口开启尝试 ---");
 
+        public_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if(public_sock == INVALID_SOCKET) {
+            if (config.auto_retry) { std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms)); continue; } else break;
+        }
+        sockaddr_in local_addr = { AF_INET, htons(*config.udp_listen_port), {INADDR_ANY} };
+        if (bind(public_sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR) {
+            closesocket(public_sock);
+            if (config.auto_retry) { std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms)); continue; } else break;
+        }
+
         for (const auto& server_str : config.stun_servers) {
             if (stun_success) break;
             size_t colon_pos = server_str.find(':');
@@ -427,33 +437,26 @@ void UDP_PortForwardingThread(Config base_config) {
                 for (int i = 0; i < config.stun_retry; ++i) {
                     Print(CYAN, "[UDP] 尝试 ", host, ":", port, " (RFC", (rfc == StunRfc::RFC5780 ? "5780" : "3489"), ", 第 ", i + 1, " 次)...");
                     
-                    public_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-                    if(public_sock == INVALID_SOCKET) continue;
+                    addrinfo* stun_res = nullptr;
+                    if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), nullptr, &stun_res) == 0) {
+                        char req[20];
+                        BuildStunRequest(req, rfc);
+                        sendto(public_sock, req, sizeof(req), 0, stun_res->ai_addr, (int)stun_res->ai_addrlen);
+                        
+                        char response_buffer[512];
+                        sockaddr_in from_addr; int from_len = sizeof(from_addr);
+                        setsockopt(public_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&config.punch_timeout_ms, sizeof(config.punch_timeout_ms));
+                        int bytes = recvfrom(public_sock, response_buffer, sizeof(response_buffer), 0, (sockaddr*)&from_addr, &from_len);
 
-                    sockaddr_in local_addr = { AF_INET, htons(*config.udp_listen_port), {INADDR_ANY} };
-                    if (bind(public_sock, (sockaddr*)&local_addr, sizeof(local_addr)) != SOCKET_ERROR) {
-                        addrinfo* stun_res = nullptr;
-                        if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), nullptr, &stun_res) == 0) {
-                            char req[20];
-                            BuildStunRequest(req, rfc);
-                            sendto(public_sock, req, sizeof(req), 0, stun_res->ai_addr, (int)stun_res->ai_addrlen);
-                            
-                            char response_buffer[512];
-                            sockaddr_in from_addr; int from_len = sizeof(from_addr);
-                            setsockopt(public_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&config.punch_timeout_ms, sizeof(config.punch_timeout_ms));
-                            int bytes = recvfrom(public_sock, response_buffer, sizeof(response_buffer), 0, (sockaddr*)&from_addr, &from_len);
-
-                            if (bytes > 20) {
-                                if (ParseStunResponse(response_buffer, bytes, rfc, public_ip, public_port)) {
-                                    stun_success = true;
-                                    memcpy(&successful_stun_server_addr, stun_res->ai_addr, stun_res->ai_addrlen);
-                                }
+                        if (bytes > 20) {
+                            if (ParseStunResponse(response_buffer, bytes, rfc, public_ip, public_port)) {
+                                stun_success = true;
+                                memcpy(&successful_stun_server_addr, stun_res->ai_addr, stun_res->ai_addrlen);
                             }
-                            freeaddrinfo(stun_res);
                         }
+                        freeaddrinfo(stun_res);
                     }
                     if (stun_success) return;
-                    closesocket(public_sock);
                     std::this_thread::sleep_for(std::chrono::milliseconds(config.stun_retry_delay_ms));
                 }
             };
@@ -464,6 +467,7 @@ void UDP_PortForwardingThread(Config base_config) {
 
         if (!stun_success) {
             Print(RED, "[UDP] 所有STUN服务器和协议均尝试失败。");
+            closesocket(public_sock);
             if (config.auto_retry) {
                 Print(YELLOW, "[UDP] 等待 ", config.retry_interval_ms / 1000, " 秒后重试...");
                 std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms));
