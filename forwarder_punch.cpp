@@ -136,12 +136,10 @@ Config ReadIniConfig(const std::wstring& filePath) {
 
     std::wstring wcontent;
     if (file_size >= 3 && buffer[0] == (char)0xEF && buffer[1] == (char)0xBB && buffer[2] == (char)0xBF) {
-        // UTF-8 BOM
         int size_needed = MultiByteToWideChar(CP_UTF8, 0, &buffer[3], file_size - 3, NULL, 0);
         wcontent.resize(size_needed);
         MultiByteToWideChar(CP_UTF8, 0, &buffer[3], file_size - 3, &wcontent[0], size_needed);
     } else {
-        // Assume UTF-8 without BOM
         int size_needed = MultiByteToWideChar(CP_UTF8, 0, buffer.data(), file_size, NULL, 0);
         wcontent.resize(size_needed);
         MultiByteToWideChar(CP_UTF8, 0, buffer.data(), file_size, &wcontent[0], size_needed);
@@ -467,6 +465,8 @@ void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
 }
 
 void TCP_PortForwardingThread(Config base_config) {
+    winrt::init_apartment();
+
     do {
         g_tcp_reconnect_flag = false;
         g_tcp_ready = false;
@@ -584,6 +584,8 @@ void TCP_PortForwardingThread(Config base_config) {
             Print(YELLOW, "[TCP] 检测到重连信号，重启流程...");
         }
     } while (base_config.auto_retry);
+
+    winrt::uninit_apartment();
 }
 
 // =================================================================================
@@ -597,6 +599,8 @@ struct UDPSession {
 };
 
 void UDP_PortForwardingThread(Config base_config) {
+    winrt::init_apartment();
+
     do {
         g_udp_reconnect_flag = false;
         g_udp_ready = false;
@@ -771,6 +775,8 @@ void UDP_PortForwardingThread(Config base_config) {
             Print(YELLOW, "[UDP] 检测到重连信号，重启流程...");
         }
     } while (base_config.auto_retry);
+
+    winrt::uninit_apartment();
 }
 
 // =================================================================================
@@ -866,8 +872,6 @@ int main(int argc, char* argv[]) {
 }
 
 void MainLogic(const Config& config) {
-    winrt::init_apartment();
-    
     Print(YELLOW, "--- TCP/UDP NAT 端口转发器 (最终版) ---");
     if (config.stun_servers.empty()) {
         Print(RED, "错误：配置文件中未找到任何 [STUN] 服务器。");
@@ -890,7 +894,4 @@ void MainLogic(const Config& config) {
     for (auto& t : threads) {
         if (t.joinable()) t.join();
     }
-
-    winrt::clear_factory_cache();
-    winrt::uninit_apartment();
 }
