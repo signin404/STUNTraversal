@@ -770,7 +770,7 @@ int main(int argc, char* argv[]) {
         FreeConsole();
     } else {
         if (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole()) {
-            SetConsoleOutputCP(65001); // *** FIX: Set console to UTF-8 ***
+            SetConsoleOutputCP(65001);
             FILE* fDummy;
             freopen_s(&fDummy, "CONOUT$", "w", stdout);
             freopen_s(&fDummy, "CONOUT$", "w", stderr);
@@ -832,6 +832,6 @@ void MainLogic(const Config& config) {
     }
 
     winrt::clear_factory_cache();
-    win_uninit_apartment();
+    winrt::uninit_apartment();
     WSACleanup();
 }
