@@ -1,4 +1,4 @@
-// main.cpp
+// main.cpp (已修复)
 // 验证方案：通过 SHGetPropertyStoreForWindow 在内存中动态注册 AUMID
 // 编译环境：Visual Studio, C++17 或更高, Windows SDK 10.0.17763.0 或更高
 // 链接库会自动通过 #pragma comment 指令包含
@@ -11,14 +11,15 @@
 #include <shobjidl.h>   // For SHGetPropertyStoreForWindow
 #include <propsys.h>    // For IPropertyStore and PKEYs
 #include <propkey.h>    // For PKEY_AppUserModel_ID
+#include <propvarutil.h> // <--- 修复编译错误 C3861: 'InitPropVariantFromString' not found
 #include <string>
-#include <propvarutil.h>
 
 // C++/WinRT headers for Toast Notifications
 #include <winrt/Windows.UI.Notifications.h>
 #include <winrt/Windows.Data.Xml.Dom.h>
 
 // 自动链接所需的库
+#pragma comment(lib, "user32.lib")   // <--- 修复链接错误 LNK2019 (unresolved external symbol)
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "propsys.lib")
@@ -129,7 +130,7 @@ void SendToastNotification(const wchar_t* aumid)
     {
         // 使用C++/WinRT发送通知
         auto notifier = winrt::Windows::UI::Notifications::ToastNotificationManager::CreateToastNotifier(aumid);
-        winrt::Windows::Data::Xml::Dom::XmlDocument toastXml;
+        winrt::Windows::Data.Xml::Dom::XmlDocument toastXml;
 
         std::wstring xml = L"<toast><visual><binding template='ToastGeneric'><text>验证成功！</text><text>";
         xml += L"此通知由一个临时的、仅存于内存的AUMID发送。";
