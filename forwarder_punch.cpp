@@ -20,6 +20,7 @@
 #include <shellapi.h>
 #include <tlhelp32.h>
 
+// For Toast Notifications
 #include <winrt/Windows.UI.Notifications.h>
 #include <winrt/Windows.Data.Xml.Dom.h>
 
@@ -38,6 +39,7 @@ std::atomic<bool> g_tcp_reconnect_flag{false};
 std::atomic<bool> g_udp_reconnect_flag{false};
 std::atomic<bool> g_tcp_ready{false};
 std::atomic<bool> g_udp_ready{false};
+std::atomic<bool> g_run_executed_this_cycle{false};
 std::mutex g_cout_mutex;
 std::mutex g_run_mutex;
 
@@ -71,6 +73,30 @@ std::string trim(const std::string& s) {
     return s.substr(first, (last - first + 1));
 }
 
+std::wstring trim_w(const std::wstring& s) {
+    size_t first = s.find_first_not_of(L" \t\r\n");
+    if (std::wstring::npos == first) return L"";
+    size_t last = s.find_last_not_of(L" \t\r\n");
+    return s.substr(first, (last - first + 1));
+}
+
+std::string WstringToString(const std::wstring& wstr) {
+    if (wstr.empty()) return "";
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
+    std::string strTo(size_needed, 0);
+    WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &strTo[0], size_needed, NULL, NULL);
+    return strTo;
+}
+
+std::wstring StringToWstring(const std::string& str) {
+    if (str.empty()) return L"";
+    int size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
+    std::wstring wstrTo(size_needed, 0);
+    MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &wstrTo[0], size_needed);
+    return wstrTo;
+}
+
+
 // =================================================================================
 // 配置管理
 // =================================================================================
@@ -95,50 +121,75 @@ struct Config {
     std::optional<std::string> run_cmd;
 };
 
-Config ReadIniConfig(const std::string& filePath) {
+Config ReadIniConfig(const std::wstring& filePath) {
     Config config;
-    std::ifstream file(filePath);
-    std::string line, current_section;
+    FILE* fp = _wfopen(filePath.c_str(), L"rb");
+    if (!fp) return config;
 
-    while (std::getline(file, line)) {
-        line = trim(line);
-        if (line.empty() || line[0] == ';' || line[0] == '#') continue;
+    fseek(fp, 0, SEEK_END);
+    long file_size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
 
-        if (line[0] == '[' && line.back() == ']') {
-            current_section = trim(line.substr(1, line.length() - 2));
+    std::vector<char> buffer(file_size);
+    fread(buffer.data(), 1, file_size, fp);
+    fclose(fp);
+
+    std::wstring wcontent;
+    if (file_size >= 3 && buffer[0] == (char)0xEF && buffer[1] == (char)0xBB && buffer[2] == (char)0xBF) {
+        // UTF-8 BOM
+        int size_needed = MultiByteToWideChar(CP_UTF8, 0, &buffer[3], file_size - 3, NULL, 0);
+        wcontent.resize(size_needed);
+        MultiByteToWideChar(CP_UTF8, 0, &buffer[3], file_size - 3, &wcontent[0], size_needed);
+    } else {
+        // Assume UTF-8 without BOM
+        int size_needed = MultiByteToWideChar(CP_UTF8, 0, buffer.data(), file_size, NULL, 0);
+        wcontent.resize(size_needed);
+        MultiByteToWideChar(CP_UTF8, 0, buffer.data(), file_size, &wcontent[0], size_needed);
+    }
+
+    std::wstringstream wss(wcontent);
+    std::wstring wline, current_section;
+
+    while (std::getline(wss, wline)) {
+        wline = trim_w(wline);
+        if (wline.empty() || wline[0] == L';' || wline[0] == L'#') continue;
+
+        if (wline[0] == L'[' && wline.back() == L']') {
+            current_section = trim_w(wline.substr(1, wline.length() - 2));
             std::transform(current_section.begin(), current_section.end(), current_section.begin(), ::tolower);
-        } else if (current_section == "stun") {
-            if(!line.empty()) config.stun_servers.push_back(line);
-        } else if (current_section == "settings") {
-            size_t eq_pos = line.find('=');
-            if (eq_pos != std::string::npos) {
-                std::string key = trim(line.substr(0, eq_pos));
-                std::string value = trim(line.substr(eq_pos + 1));
-                std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+        } else if (current_section == L"stun") {
+            if(!wline.empty()) config.stun_servers.push_back(WstringToString(wline));
+        } else if (current_section == L"settings") {
+            size_t eq_pos = wline.find(L'=');
+            if (eq_pos != std::wstring::npos) {
+                std::wstring key_w = trim_w(wline.substr(0, eq_pos));
+                std::wstring value_w = trim_w(wline.substr(eq_pos + 1));
+                std::transform(key_w.begin(), key_w.end(), key_w.begin(), ::tolower);
+                std::string value = WstringToString(value_w);
 
                 try {
-                    if (key == "tcplistenport") config.tcp_listen_port = std::stoi(value);
-                    else if (key == "tcpforwardhost") config.tcp_forward_host = value;
-                    else if (key == "tcpforwardport") {
+                    if (key_w == L"tcplistenport") config.tcp_listen_port = std::stoi(value);
+                    else if (key_w == L"tcpforwardhost") config.tcp_forward_host = value;
+                    else if (key_w == L"tcpforwardport") {
                         std::transform(value.begin(), value.end(), value.begin(), ::tolower);
                         if (value == "auto") config.tcp_forward_port = 0; else config.tcp_forward_port = std::stoi(value);
                     }
-                    else if (key == "udplistenport") config.udp_listen_port = std::stoi(value);
-                    else if (key == "udpforwardhost") config.udp_forward_host = value;
-                    else if (key == "udpforwardport") {
+                    else if (key_w == L"udplistenport") config.udp_listen_port = std::stoi(value);
+                    else if (key_w == L"udpforwardhost") config.udp_forward_host = value;
+                    else if (key_w == L"udpforwardport") {
                         std::transform(value.begin(), value.end(), value.begin(), ::tolower);
                         if (value == "auto") config.udp_forward_port = 0; else config.udp_forward_port = std::stoi(value);
                     }
-                    else if (key == "punchtimeoutms") config.punch_timeout_ms = std::stoi(value);
-                    else if (key == "keepalivems") config.keep_alive_ms = std::stoi(value);
-                    else if (key == "retryintervalms") config.retry_interval_ms = std::stoi(value);
-                    else if (key == "autoretry") config.auto_retry = (std::stoi(value) == 1);
-                    else if (key == "stunretry") config.stun_retry = std::stoi(value);
-                    else if (key == "stunretrydelayms") config.stun_retry_delay_ms = std::stoi(value);
-                    else if (key == "udpsessiontimeoutms") config.udp_session_timeout_ms = std::stoi(value);
-                    else if (key == "udpmaxchunklength") config.udp_max_chunk_length = std::stoi(value);
-                    else if (key == "run") config.run_path = value;
-                    else if (key == "runcmd") config.run_cmd = value;
+                    else if (key_w == L"punchtimeoutms") config.punch_timeout_ms = std::stoi(value);
+                    else if (key_w == L"keepalivems") config.keep_alive_ms = std::stoi(value);
+                    else if (key_w == L"retryintervalms") config.retry_interval_ms = std::stoi(value);
+                    else if (key_w == L"autoretry") config.auto_retry = (std::stoi(value) == 1);
+                    else if (key_w == L"stunretry") config.stun_retry = std::stoi(value);
+                    else if (key_w == L"stunretrydelayms") config.stun_retry_delay_ms = std::stoi(value);
+                    else if (key_w == L"udpsessiontimeoutms") config.udp_session_timeout_ms = std::stoi(value);
+                    else if (key_w == L"udpmaxchunklength") config.udp_max_chunk_length = std::stoi(value);
+                    else if (key_w == L"run") config.run_path = value;
+                    else if (key_w == L"runcmd") config.run_cmd = value;
                 } catch (const std::exception&) { /* ignore bad values */ }
             }
         }
@@ -224,9 +275,7 @@ void ShowToastNotification(const std::wstring& message) {
         toastXml.LoadXml(xml_content);
         winrt::Windows::UI::Notifications::ToastNotification notification(toastXml);
         notifier.Show(notification);
-    } catch (const winrt::hresult_error&) {
-        // Handle error, e.g., if notifications are disabled
-    }
+    } catch (const winrt::hresult_error&) {}
 }
 
 bool IsProcessRunning(const std::wstring& processName) {
@@ -246,10 +295,9 @@ bool IsProcessRunning(const std::wstring& processName) {
 }
 
 void ExecuteRunCommand(const Config& config) {
-    std::lock_guard<std::mutex> lock(g_run_mutex);
     if (!config.run_path || config.run_path->empty()) return;
 
-    std::wstring wide_run_path(config.run_path->begin(), config.run_path->end());
+    std::wstring wide_run_path = StringToWstring(*config.run_path);
     wchar_t expanded_path[MAX_PATH];
     ExpandEnvironmentStringsW(wide_run_path.c_str(), expanded_path, MAX_PATH);
 
@@ -260,10 +308,7 @@ void ExecuteRunCommand(const Config& config) {
     std::wstring process_name(file_part);
 
     if (!IsProcessRunning(process_name)) {
-        int size_needed = WideCharToMultiByte(CP_UTF8, 0, process_name.c_str(), (int)process_name.size(), NULL, 0, NULL, NULL);
-        std::string process_name_str(size_needed, 0);
-        WideCharToMultiByte(CP_UTF8, 0, process_name.c_str(), (int)process_name.size(), &process_name_str[0], size_needed, NULL, NULL);
-        Print(YELLOW, "[RUN] 目标进程 ", process_name_str, " 未运行，跳过执行。");
+        Print(YELLOW, "[RUN] 目标进程 ", WstringToString(process_name), " 未运行，跳过执行。");
         return;
     }
 
@@ -279,13 +324,10 @@ void ExecuteRunCommand(const Config& config) {
     replace(cmd, "{TCPPort}", g_tcp_port_str);
     replace(cmd, "{UDPPort}", g_udp_port_str);
 
-    std::wstring wide_cmd(cmd.begin(), cmd.end());
+    std::wstring wide_cmd = StringToWstring(cmd);
     std::wstring quoted_path = L"\"" + std::wstring(absolute_path) + L"\"";
 
-    int size_needed = WideCharToMultiByte(CP_UTF8, 0, quoted_path.c_str(), (int)quoted_path.size(), NULL, 0, NULL, NULL);
-    std::string quoted_path_str(size_needed, 0);
-    WideCharToMultiByte(CP_UTF8, 0, quoted_path.c_str(), (int)quoted_path.size(), &quoted_path_str[0], size_needed, NULL, NULL);
-    Print(GREEN, "[RUN] 正在执行: ", quoted_path_str, " ", cmd);
+    Print(GREEN, "[RUN] 正在执行: ", WstringToString(quoted_path), " ", cmd);
 
     SHELLEXECUTEINFOW sei = { sizeof(sei) };
     sei.fMask = SEE_MASK_NOCLOSEPROCESS;
@@ -300,19 +342,25 @@ void ExecuteRunCommand(const Config& config) {
     }
 }
 
-void CheckAndExecuteRun(const Config& config, bool tcp_enabled, bool udp_enabled) {
+bool CheckAndExecuteRun(const Config& config, bool tcp_enabled, bool udp_enabled) {
+    std::lock_guard<std::mutex> lock(g_run_mutex);
+    if (g_run_executed_this_cycle) return true;
+
     bool tcp_ok = !tcp_enabled || g_tcp_ready;
     bool udp_ok = !udp_enabled || g_udp_ready;
 
     if (tcp_ok && udp_ok) {
         ExecuteRunCommand(config);
         if (g_is_hidden) {
-            std::wstring msg = L"IP: " + std::wstring(g_public_ip.begin(), g_public_ip.end());
-            if (tcp_enabled) msg += L"\nTCP: " + std::wstring(g_tcp_port_str.begin(), g_tcp_port_str.end());
-            if (udp_enabled) msg += L"\nUDP: " + std::wstring(g_udp_port_str.begin(), g_udp_port_str.end());
+            std::wstring msg = L"IP: " + StringToWstring(g_public_ip);
+            if (tcp_enabled) msg += L"\nTCP: " + StringToWstring(g_tcp_port_str);
+            if (udp_enabled) msg += L"\nUDP: " + StringToWstring(g_udp_port_str);
             ShowToastNotification(msg);
         }
+        g_run_executed_this_cycle = true;
+        return true;
     }
+    return false;
 }
 
 // =================================================================================
@@ -422,6 +470,7 @@ void TCP_PortForwardingThread(Config base_config) {
     do {
         g_tcp_reconnect_flag = false;
         g_tcp_ready = false;
+        g_run_executed_this_cycle = false;
         Config config = base_config;
         SOCKET listener_sock = INVALID_SOCKET, stun_heartbeat_sock = INVALID_SOCKET;
         std::string public_ip; int public_port;
@@ -505,7 +554,10 @@ void TCP_PortForwardingThread(Config base_config) {
         Print(LIGHT_GREEN, "[TCP] 成功！公网端口 ", public_ip, ":", public_port, " 已开启并监听。");
         
         g_tcp_ready = true;
-        CheckAndExecuteRun(base_config, base_config.tcp_listen_port.has_value(), base_config.udp_listen_port.has_value());
+        while (!CheckAndExecuteRun(base_config, base_config.tcp_listen_port.has_value(), base_config.udp_listen_port.has_value())) {
+            if (g_tcp_reconnect_flag || g_udp_reconnect_flag) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
         
         std::thread(TCP_StunCheckThread, public_ip, public_port, config, *config.tcp_listen_port).detach();
 
@@ -548,6 +600,7 @@ void UDP_PortForwardingThread(Config base_config) {
     do {
         g_udp_reconnect_flag = false;
         g_udp_ready = false;
+        g_run_executed_this_cycle = false;
         Config config = base_config;
         SOCKET public_sock = INVALID_SOCKET;
         std::string public_ip; int public_port;
@@ -627,7 +680,10 @@ void UDP_PortForwardingThread(Config base_config) {
         Print(LIGHT_GREEN, "[UDP] 成功！公网端口 ", public_ip, ":", public_port, " 已开启。");
         
         g_udp_ready = true;
-        CheckAndExecuteRun(base_config, base_config.tcp_listen_port.has_value(), base_config.udp_listen_port.has_value());
+        while (!CheckAndExecuteRun(base_config, base_config.tcp_listen_port.has_value(), base_config.udp_listen_port.has_value())) {
+            if (g_tcp_reconnect_flag || g_udp_reconnect_flag) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
 
         auto last_cleanup_time = std::chrono::steady_clock::now();
         auto last_keepalive_time = std::chrono::steady_clock::now();
@@ -724,13 +780,13 @@ void UDP_PortForwardingThread(Config base_config) {
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     if (uMsg == WM_APP_EXECUTE_RUN) {
         Print(CYAN, "[IPC] 收到 -run 命令，正在执行...");
-        char exe_path_char[MAX_PATH];
-        GetModuleFileNameA(NULL, exe_path_char, MAX_PATH);
-        std::string exe_path_str = exe_path_char;
-        std::string exe_name = exe_path_str.substr(exe_path_str.find_last_of("/\\") + 1);
-        std::string ini_name = exe_name.substr(0, exe_name.rfind('.'));
-        PathRemoveFileSpecA(exe_path_char);
-        std::string iniPath = std::string(exe_path_char) + "\\" + ini_name + ".ini";
+        wchar_t exe_path_wchar[MAX_PATH];
+        GetModuleFileNameW(NULL, exe_path_wchar, MAX_PATH);
+        std::wstring exe_path_str = exe_path_wchar;
+        std::wstring exe_name = exe_path_str.substr(exe_path_str.find_last_of(L"/\\") + 1);
+        std::wstring ini_name = exe_name.substr(0, exe_name.rfind(L'.'));
+        PathRemoveFileSpecW(exe_path_wchar);
+        std::wstring iniPath = std::wstring(exe_path_wchar) + L"\\" + ini_name + L".ini";
         Config config = ReadIniConfig(iniPath);
         ExecuteRunCommand(config);
         return 0;
@@ -750,12 +806,11 @@ int main(int argc, char* argv[]) {
         if (strcmp(argv[i], "-run") == 0) run_command_only = true;
     }
 
-    char exe_path_char[MAX_PATH];
-    GetModuleFileNameA(NULL, exe_path_char, MAX_PATH);
-    std::string exe_path_str = exe_path_char;
-    std::string exe_name = exe_path_str.substr(exe_path_str.find_last_of("/\\") + 1);
-    std::string mutex_name_str = exe_name.substr(0, exe_name.rfind('.'));
-    std::wstring mutex_name(mutex_name_str.begin(), mutex_name_str.end());
+    wchar_t exe_path_wchar[MAX_PATH];
+    GetModuleFileNameW(NULL, exe_path_wchar, MAX_PATH);
+    std::wstring exe_path_str = exe_path_wchar;
+    std::wstring exe_name = exe_path_str.substr(exe_path_str.find_last_of(L"/\\") + 1);
+    std::wstring mutex_name = exe_name.substr(0, exe_name.rfind(L'.'));
 
     HANDLE hMutex = CreateMutexW(NULL, TRUE, mutex_name.c_str());
     if (hMutex != NULL && GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -790,8 +845,8 @@ int main(int argc, char* argv[]) {
     RegisterClassW(&wc);
     g_hMessageWindow = CreateWindowExW(0, mutex_name.c_str(), L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, NULL, NULL);
 
-    PathRemoveFileSpecA(exe_path_char);
-    std::string iniPath = std::string(exe_path_char) + "\\" + mutex_name_str + ".ini";
+    PathRemoveFileSpecW(exe_path_wchar);
+    std::wstring iniPath = std::wstring(exe_path_wchar) + L"\\" + mutex_name + L".ini";
     Config config = ReadIniConfig(iniPath);
     
     std::thread main_thread(MainLogic, config);
