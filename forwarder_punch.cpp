@@ -1,6 +1,5 @@
-// main.cpp (终极版)
-// 验证方案：结合程序化创建的快捷方式 (注册契约) 和内存中的AUMID绑定 (身份认领)
-// 编译环境：Visual Studio, C++17 或更高, Windows SDK 10.0.17763.0 或更高
+// main.cpp (最终答案版)
+// 核心修复：在单线程单元 (STA) 中初始化COM/WinRT环境
 
 #ifndef UNICODE
 #define UNICODE
@@ -12,7 +11,7 @@
 #include <propkey.h>
 #include <propvarutil.h>
 #include <string>
-#include <shlobj.h>     // For SHGetKnownFolderPath
+#include <shlobj.h>
 #include <winrt/Windows.UI.Notifications.h>
 #include <winrt/Windows.Data.Xml.Dom.h>
 
@@ -22,33 +21,34 @@
 #pragma comment(lib, "propsys.lib")
 #pragma comment(lib, "windowsapp.lib")
 
-// --- 核心定义 ---
-const wchar_t* AUMID = L"MyCompany.MyUltimateValidationApp.1";
-const wchar_t* SHORTCUT_NAME = L"ValidationApp.lnk";
+const wchar_t* AUMID = L"MyCompany.TheFinalAnswerApp.1";
+const wchar_t* SHORTCUT_NAME = L"FinalAnswer.lnk";
 
-// 函数原型
+// 函数原型无需改变
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 bool SetAumidForWindow(HWND hwnd, const wchar_t* aumid);
 void SendToastNotification(const wchar_t* aumid);
 bool InstallShortcut(const wchar_t* shortcutName, const wchar_t* aumid);
 void RemoveShortcut(const wchar_t* shortcutName);
+std::wstring GetStartMenuProgramsPath();
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow)
 {
-    winrt::init_apartment();
-    CoInitialize(NULL);
+    // --- 决定性的、唯一的修复 ---
+    // 初始化一个单线程单元 (STA)。所有UI相关的COM/WinRT操作都必须在这里进行。
+    winrt::init_apartment(winrt::apartment_type::single_threaded);
+    
+    // CoInitialize现在不再需要，因为winrt::init_apartment已经处理了
+    // CoInitialize(NULL); 
 
-    // 1. 【创建注册契约】在开始菜单中创建带有AUMID的快捷方式
-    // 这是让通知中心“认识”我们的关键一步
     if (!InstallShortcut(SHORTCUT_NAME, AUMID)) {
-        MessageBox(NULL, L"无法创建开始菜单快捷方式。\n请确保程序有权限写入 %APPDATA%", L"错误", MB_OK);
+        MessageBox(NULL, L"无法创建开始菜单快捷方式。", L"错误", MB_OK);
         return 0;
     }
     
-    // 注册一个函数，确保程序退出时清理快捷方式
-    atexit([] { RemoveShortcut(SHORTCUT_NAME); CoUninitialize(); });
+    atexit([] { RemoveShortcut(SHORTCUT_NAME); });
 
-    const wchar_t CLASS_NAME[] = L"UltimateValidationSample";
+    const wchar_t CLASS_NAME[] = L"FinalAnswerSample";
     WNDCLASS wc = { };
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = hInstance;
@@ -56,22 +56,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
     RegisterClass(&wc);
 
     HWND hwnd = CreateWindowEx(
-        0, CLASS_NAME, L"终极验证窗口", WS_OVERLAPPEDWINDOW,
+        0, CLASS_NAME, L"最终答案验证", WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 400, 300,
         NULL, NULL, hInstance, NULL
     );
 
     if (hwnd == NULL) return 0;
 
-    // 2. 【运行时认领身份】将AUMID绑定到窗口句柄
-    // 告诉系统，我这个进程就是那个快捷方式代表的应用
     SetAumidForWindow(hwnd, AUMID);
 
-    // 显示窗口并确保其已激活
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
     
-    // 3. 【发送通知】在“契约”和“认领”都完成后发送
     SendToastNotification(AUMID);
     
     MSG msg = { };
@@ -83,15 +79,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
     return 0;
 }
 
+// WindowProc, SetAumidForWindow, SendToastNotification 
+// GetStartMenuProgramsPath 函数保持不变
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    if (uMsg == WM_DESTROY) {
-        PostQuitMessage(0);
-        return 0;
-    }
+    if (uMsg == WM_DESTROY) { PostQuitMessage(0); return 0; }
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
-
-// 内存绑定部分 (不变)
 bool SetAumidForWindow(HWND hwnd, const wchar_t* aumid) {
     IPropertyStore* pps;
     if (SUCCEEDED(SHGetPropertyStoreForWindow(hwnd, IID_PPV_ARGS(&pps)))) {
@@ -105,13 +98,11 @@ bool SetAumidForWindow(HWND hwnd, const wchar_t* aumid) {
     }
     return false;
 }
-
-// 发送通知部分 (不变)
 void SendToastNotification(const wchar_t* aumid) {
     try {
         auto notifier = winrt::Windows::UI::Notifications::ToastNotificationManager::CreateToastNotifier(aumid);
         winrt::Windows::Data::Xml::Dom::XmlDocument toastXml;
-        std::wstring xml = L"<toast><visual><binding template='ToastGeneric'><text>终极验证成功！</text><text>此通知结合了快捷方式“契约”和内存“认领”。</text></binding></visual></toast>";
+        std::wstring xml = L"<toast><visual><binding template='ToastGeneric'><text>终极验证成功！</text><text>COM线程模型 (STA) 是最后的关键。</text></binding></visual></toast>";
         toastXml.LoadXml(xml);
         winrt::Windows::UI::Notifications::ToastNotification notification(toastXml);
         notifier.Show(notification);
@@ -120,8 +111,6 @@ void SendToastNotification(const wchar_t* aumid) {
         MessageBox(NULL, e.message().c_str(), L"Toast 发送失败", MB_OK);
     }
 }
-
-// 【新函数】获取开始菜单程序文件夹的路径
 std::wstring GetStartMenuProgramsPath() {
     PWSTR pszPath = NULL;
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Programs, 0, NULL, &pszPath))) {
@@ -132,21 +121,17 @@ std::wstring GetStartMenuProgramsPath() {
     return L"";
 }
 
-// 【新函数】创建并注册快捷方式 (已添加Shell通知)
+// 包含SHChangeNotify的快捷方式函数 (不变)
 bool InstallShortcut(const wchar_t* shortcutName, const wchar_t* aumid) {
     std::wstring shortcutPath = GetStartMenuProgramsPath();
     if (shortcutPath.empty()) return false;
     shortcutPath += L"\\" + std::wstring(shortcutName);
-
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(NULL, exePath, MAX_PATH);
-
     IShellLink* psl = NULL;
     HRESULT hr = CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLink, (LPVOID*)&psl);
-
     if (SUCCEEDED(hr)) {
         psl->SetPath(exePath);
-        
         IPropertyStore* pps = NULL;
         hr = psl->QueryInterface(IID_IPropertyStore, (void**)&pps);
         if (SUCCEEDED(hr)) {
@@ -158,7 +143,6 @@ bool InstallShortcut(const wchar_t* shortcutName, const wchar_t* aumid) {
             }
             pps->Release();
         }
-
         IPersistFile* ppf = NULL;
         hr = psl->QueryInterface(IID_IPersistFile, (void**)&ppf);
         if (SUCCEEDED(hr)) {
@@ -167,28 +151,17 @@ bool InstallShortcut(const wchar_t* shortcutName, const wchar_t* aumid) {
         }
         psl->Release();
     }
-
     if (SUCCEEDED(hr)) {
-        // --- 决定性的一步 ---
-        // 强制通知 Shell，一个新的快捷方式已被创建。
-        // 这会触发Shell缓存的更新，让通知中心能够立即识别我们的AUMID。
         SHChangeNotify(SHCNE_CREATE, SHCNF_PATH, shortcutPath.c_str(), NULL);
-        
-        // 添加一个微小的延迟，给Shell处理通知留出时间片
         Sleep(100); 
     }
-
     return SUCCEEDED(hr);
 }
-
-// 【新函数】清理快捷方式 (已添加Shell通知)
 void RemoveShortcut(const wchar_t* shortcutName) {
     std::wstring shortcutPath = GetStartMenuProgramsPath();
     if (shortcutPath.empty()) return;
     shortcutPath += L"\\" + std::wstring(shortcutName);
-    
     if(DeleteFileW(shortcutPath.c_str())) {
-        // 通知 Shell，快捷方式已被删除
         SHChangeNotify(SHCNE_DELETE, SHCNF_PATH, shortcutPath.c_str(), NULL);
     }
 }
