@@ -20,7 +20,6 @@
 #include <shellapi.h>
 #include <tlhelp32.h>
 
-// For Toast Notifications
 #include <winrt/Windows.UI.Notifications.h>
 #include <winrt/Windows.Data.Xml.Dom.h>
 
@@ -771,6 +770,7 @@ int main(int argc, char* argv[]) {
         FreeConsole();
     } else {
         if (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole()) {
+            SetConsoleOutputCP(65001); // *** FIX: Set console to UTF-8 ***
             FILE* fDummy;
             freopen_s(&fDummy, "CONOUT$", "w", stdout);
             freopen_s(&fDummy, "CONOUT$", "w", stderr);
@@ -832,6 +832,6 @@ void MainLogic(const Config& config) {
     }
 
     winrt::clear_factory_cache();
-    winrt::uninit_apartment();
+    win_uninit_apartment();
     WSACleanup();
 }
