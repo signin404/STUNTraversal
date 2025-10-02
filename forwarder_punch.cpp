@@ -79,7 +79,7 @@ void HandleNewConnection(SOCKET peer_sock, Config config) {
     char peer_ip_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &peer_addr.sin_addr, peer_ip_str, sizeof(peer_ip_str));
     SetColor(GREEN);
-    std::cout << "[新连接] 接受来自 " << peer_ip_str << ":" << ntohs(peer_addr.sin_port) << " 的连接。" << std.endl;
+    std::cout << "[新连接] 接受来自 " << peer_ip_str << ":" << ntohs(peer_addr.sin_port) << " 的连接。" << std::endl;
     SOCKET target_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     addrinfo* fwd_res = nullptr;
     getaddrinfo(config.forward_host.c_str(), std::to_string(config.forward_port).c_str(), nullptr, &fwd_res);
@@ -96,13 +96,12 @@ void HandleNewConnection(SOCKET peer_sock, Config config) {
     freeaddrinfo(fwd_res);
 }
 
-// --- 单边打洞并监听的主逻辑 (最终版) ---
+// --- 单边打洞并监听的主逻辑 (已修复) ---
 void PortForwardingThread(Config config) {
     do {
         SetColor(WHITE);
         std::cout << "\n--- 开始新一轮端口开启尝试 ---" << std::endl;
 
-        // 步骤 1: 创建监听和心跳套接字
         SOCKET listener_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         SOCKET stun_heartbeat_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         
@@ -112,7 +111,6 @@ void PortForwardingThread(Config config) {
 
         sockaddr_in local_addr = { AF_INET, htons(config.local_punch_port), {INADDR_ANY} };
 
-        // 步骤 2: 绑定两个套接字到同一本地端口
         if (bind(listener_sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR ||
             bind(stun_heartbeat_sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR) {
             SetColor(RED); std::cerr << "[错误] 无法绑定本地端口 " << config.local_punch_port << "。" << std::endl;
@@ -122,14 +120,12 @@ void PortForwardingThread(Config config) {
         SetColor(CYAN);
         std::cout << "[步骤 1] 套接字已成功绑定至本地端口 " << config.local_punch_port << "。" << std::endl;
 
-        // 步骤 3: 监听套接字进入监听状态 (必须在 connect 之前)
         if (listen(listener_sock, SOMAXCONN) == SOCKET_ERROR) {
             SetColor(RED); std::cerr << "[错误] 监听套接字 listen() 失败。" << std::endl;
             closesocket(listener_sock); closesocket(stun_heartbeat_sock);
             if (config.auto_retry) { std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms)); continue; } else break;
         }
 
-        // 步骤 4: 使用心跳套接字连接 STUN 服务器
         SetColor(CYAN);
         std::cout << "[步骤 2] 正在连接 STUN 服务器 '" << config.stun_server_host << "' 以发现并保持端口..." << std::endl;
         addrinfo* stun_res = nullptr;
@@ -147,10 +143,14 @@ void PortForwardingThread(Config config) {
         }
         freeaddrinfo(stun_res);
 
-        // 步骤 5: 在已连接的心跳套接字上发送 STUN 请求
         char req[20] = { 0 };
         *(unsigned short*)req = htons(0x0001); *(unsigned short*)(req + 2) = 0; *(unsigned int*)(req + 4) = htonl(0x2112A442);
-        std::random_device rd; std::mt19937 gen(rd()); std::uniform_int_distribution<unsigned int> dis;
+        
+        // *** FIX: Corrected Most Vexing Parse and split into multiple lines ***
+        std::random_device rd;
+        std::mt19937 gen(rd); // Correct: pass the object 'rd', not the function call 'rd()'
+        std::uniform_int_distribution<unsigned int> dis;
+        
         for (int i = 0; i < 3; ++i) { *(unsigned int*)(req + 8 + i * 4) = dis(gen); }
         if (send(stun_heartbeat_sock, req, sizeof(req), 0) == SOCKET_ERROR) {
             SetColor(RED); std::cerr << "[失败] 发送 STUN 请求失败。" << std::endl;
@@ -158,7 +158,6 @@ void PortForwardingThread(Config config) {
             if (config.auto_retry) { std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms)); continue; } else break;
         }
 
-        // 步骤 6: 接收并解析 STUN 响应以获取真实的公网端口
         std::string public_ip; int public_port; bool stun_success = false;
         char header_buffer[20];
         if (RecvAll(stun_heartbeat_sock, header_buffer, 20)) {
@@ -193,7 +192,6 @@ void PortForwardingThread(Config config) {
             if (config.auto_retry) { std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms)); continue; } else break;
         }
 
-        // 步骤 7: 成功！保持心跳连接，开始接受外部连接
         tcp_keepalive ka; ka.onoff = (u_long)1; ka.keepalivetime = config.keep_alive_ms; ka.keepaliveinterval = 1000;
         DWORD bytes_returned;
         WSAIoctl(stun_heartbeat_sock, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), NULL, 0, &bytes_returned, NULL, NULL);
