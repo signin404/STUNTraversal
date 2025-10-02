@@ -11,15 +11,29 @@
 #include <sstream>
 #include <atomic>
 #include <mutex>
+#include <future> // 用于 std::promise
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <shlwapi.h>
 #include <mstcpip.h>
+#include <shellapi.h>
+#include <tlhelp32.h>
+#include <winreg.h> // 用于注册表操作
+
+// For Toast Notifications
+#include <winrt/Windows.UI.Notifications.h>
+#include <winrt/Windows.Data.Xml.Dom.h>
+#include <winrt/Windows.Foundation.h>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "windowsapp.lib")
+#pragma comment(lib, "advapi32.lib") // 用于注册表操作
+#pragma comment(linker, "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup")
 
 // =================================================================================
 // 全局定义和辅助工具
@@ -27,18 +41,32 @@
 
 std::atomic<bool> g_tcp_reconnect_flag{false};
 std::atomic<bool> g_udp_reconnect_flag{false};
+std::atomic<bool> g_tcp_ready{false};
+std::atomic<bool> g_udp_ready{false};
+std::atomic<bool> g_run_executed_this_cycle{false};
 std::mutex g_cout_mutex;
+std::mutex g_run_mutex;
+
+HWND g_hMessageWindow = NULL;
+UINT const WM_APP_EXECUTE_RUN = WM_APP + 1;
+UINT const WM_APP_SHOW_NOTIFICATION = WM_APP + 2; // 【新】为 -show 命令添加的消息
+
+bool g_is_hidden = false;
+std::string g_public_ip, g_tcp_port_str, g_udp_port_str;
+std::wstring g_app_name; // 全局应用程序名称 (AUMID)
 
 enum class StunRfc { RFC3489, RFC5780 };
 
 enum ConsoleColor { DARKBLUE = 1, GREEN = 2, CYAN = 3, RED = 4, MAGENTA = 5, YELLOW = 6, WHITE = 7, GRAY = 8, LIGHT_GREEN = 10 };
-void SetColor(ConsoleColor color) { 
+void SetColor(ConsoleColor color) {
+    if (g_is_hidden) return;
     std::lock_guard<std::mutex> lock(g_cout_mutex);
-    SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), color); 
+    SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), color);
 }
 
 template<typename... Args>
 void Print(ConsoleColor color, Args&&... args) {
+    if (g_is_hidden) return;
     std::lock_guard<std::mutex> lock(g_cout_mutex);
     SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), color);
     (std::cout << ... << args) << std::endl;
@@ -50,6 +78,30 @@ std::string trim(const std::string& s) {
     size_t last = s.find_last_not_of(" \t\r\n");
     return s.substr(first, (last - first + 1));
 }
+
+std::wstring trim_w(const std::wstring& s) {
+    size_t first = s.find_first_not_of(L" \t\r\n");
+    if (std::wstring::npos == first) return L"";
+    size_t last = s.find_last_not_of(L" \t\r\n");
+    return s.substr(first, (last - first + 1));
+}
+
+std::string WstringToString(const std::wstring& wstr) {
+    if (wstr.empty()) return "";
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
+    std::string strTo(size_needed, 0);
+    WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &strTo[0], size_needed, NULL, NULL);
+    return strTo;
+}
+
+std::wstring StringToWstring(const std::string& str) {
+    if (str.empty()) return L"";
+    int size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
+    std::wstring wstrTo(size_needed, 0);
+    MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &wstrTo[0], size_needed);
+    return wstrTo;
+}
+
 
 // =================================================================================
 // 配置管理
@@ -71,52 +123,77 @@ struct Config {
     int stun_retry_delay_ms = 200;
     int udp_session_timeout_ms = 30000;
     int udp_max_chunk_length = 1500;
-    int udp_keep_alive_interval_s = 20;
+    std::optional<std::string> run_path;
+    std::optional<std::string> run_cmd;
 };
 
-Config ReadIniConfig(const std::string& filePath) {
+Config ReadIniConfig(const std::wstring& filePath) {
     Config config;
-    std::ifstream file(filePath);
-    std::string line, current_section;
+    FILE* fp = _wfopen(filePath.c_str(), L"rb");
+    if (!fp) return config;
 
-    while (std::getline(file, line)) {
-        line = trim(line);
-        if (line.empty() || line[0] == ';' || line[0] == '#') continue;
+    fseek(fp, 0, SEEK_END);
+    long file_size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
 
-        if (line[0] == '[' && line.back() == ']') {
-            current_section = trim(line.substr(1, line.length() - 2));
+    std::vector<char> buffer(file_size);
+    fread(buffer.data(), 1, file_size, fp);
+    fclose(fp);
+
+    std::wstring wcontent;
+    if (file_size >= 3 && buffer[0] == (char)0xEF && buffer[1] == (char)0xBB && buffer[2] == (char)0xBF) {
+        int size_needed = MultiByteToWideChar(CP_UTF8, 0, &buffer[3], file_size - 3, NULL, 0);
+        wcontent.resize(size_needed);
+        MultiByteToWideChar(CP_UTF8, 0, &buffer[3], file_size - 3, &wcontent[0], size_needed);
+    } else {
+        int size_needed = MultiByteToWideChar(CP_UTF8, 0, buffer.data(), file_size, NULL, 0);
+        wcontent.resize(size_needed);
+        MultiByteToWideChar(CP_UTF8, 0, buffer.data(), file_size, &wcontent[0], size_needed);
+    }
+
+    std::wstringstream wss(wcontent);
+    std::wstring wline, current_section;
+
+    while (std::getline(wss, wline)) {
+        wline = trim_w(wline);
+        if (wline.empty() || wline[0] == L';' || wline[0] == L'#') continue;
+
+        if (wline[0] == L'[' && wline.back() == L']') {
+            current_section = trim_w(wline.substr(1, wline.length() - 2));
             std::transform(current_section.begin(), current_section.end(), current_section.begin(), ::tolower);
-        } else if (current_section == "stun") {
-            if(!line.empty()) config.stun_servers.push_back(line);
-        } else if (current_section == "settings") {
-            size_t eq_pos = line.find('=');
-            if (eq_pos != std::string::npos) {
-                std::string key = trim(line.substr(0, eq_pos));
-                std::string value = trim(line.substr(eq_pos + 1));
-                std::transform(key.begin(), key.end(), key.begin(), ::tolower);
+        } else if (current_section == L"stun") {
+            if(!wline.empty()) config.stun_servers.push_back(WstringToString(wline));
+        } else if (current_section == L"settings") {
+            size_t eq_pos = wline.find(L'=');
+            if (eq_pos != std::wstring::npos) {
+                std::wstring key_w = trim_w(wline.substr(0, eq_pos));
+                std::wstring value_w = trim_w(wline.substr(eq_pos + 1));
+                std::transform(key_w.begin(), key_w.end(), key_w.begin(), ::tolower);
+                std::string value = WstringToString(value_w);
 
                 try {
-                    if (key == "tcplistenport") config.tcp_listen_port = std::stoi(value);
-                    else if (key == "tcpforwardhost") config.tcp_forward_host = value;
-                    else if (key == "tcpforwardport") {
+                    if (key_w == L"tcplistenport") config.tcp_listen_port = std::stoi(value);
+                    else if (key_w == L"tcpforwardhost") config.tcp_forward_host = value;
+                    else if (key_w == L"tcpforwardport") {
                         std::transform(value.begin(), value.end(), value.begin(), ::tolower);
                         if (value == "auto") config.tcp_forward_port = 0; else config.tcp_forward_port = std::stoi(value);
                     }
-                    else if (key == "udplistenport") config.udp_listen_port = std::stoi(value);
-                    else if (key == "udpforwardhost") config.udp_forward_host = value;
-                    else if (key == "udpforwardport") {
+                    else if (key_w == L"udplistenport") config.udp_listen_port = std::stoi(value);
+                    else if (key_w == L"udpforwardhost") config.udp_forward_host = value;
+                    else if (key_w == L"udpforwardport") {
                         std::transform(value.begin(), value.end(), value.begin(), ::tolower);
                         if (value == "auto") config.udp_forward_port = 0; else config.udp_forward_port = std::stoi(value);
                     }
-                    else if (key == "punchtimeoutms") config.punch_timeout_ms = std::stoi(value);
-                    else if (key == "keepalivems") config.keep_alive_ms = std::stoi(value);
-                    else if (key == "retryintervalms") config.retry_interval_ms = std::stoi(value);
-                    else if (key == "autoretry") config.auto_retry = (std::stoi(value) == 1);
-                    else if (key == "stunretry") config.stun_retry = std::stoi(value);
-                    else if (key == "stunretrydelayms") config.stun_retry_delay_ms = std::stoi(value);
-                    else if (key == "udpsessiontimeoutms") config.udp_session_timeout_ms = std::stoi(value);
-                    else if (key == "udpmaxchunklength") config.udp_max_chunk_length = std::stoi(value);
-                    else if (key == "udpkeepaliveintervals") config.udp_keep_alive_interval_s = std::stoi(value);
+                    else if (key_w == L"punchtimeoutms") config.punch_timeout_ms = std::stoi(value);
+                    else if (key_w == L"keepalivems") config.keep_alive_ms = std::stoi(value);
+                    else if (key_w == L"retryintervalms") config.retry_interval_ms = std::stoi(value);
+                    else if (key_w == L"autoretry") config.auto_retry = (std::stoi(value) == 1);
+                    else if (key_w == L"stunretry") config.stun_retry = std::stoi(value);
+                    else if (key_w == L"stunretrydelayms") config.stun_retry_delay_ms = std::stoi(value);
+                    else if (key_w == L"udpsessiontimeoutms") config.udp_session_timeout_ms = std::stoi(value);
+                    else if (key_w == L"udpmaxchunklength") config.udp_max_chunk_length = std::stoi(value);
+                    else if (key_w == L"run") config.run_path = value;
+                    else if (key_w == L"runcmd") config.run_cmd = value;
                 } catch (const std::exception&) { /* ignore bad values */ }
             }
         }
@@ -185,6 +262,165 @@ bool ParseStunResponse(char* response_buffer, int response_len, StunRfc rfc, std
 }
 
 // =================================================================================
+// 外部程序调用和系统通知
+// =================================================================================
+
+// 【推荐】使用这个完全异步的版本替换旧的 ShowToastNotification 函数
+void ShowToastNotification(const std::wstring& aumid, const std::wstring& message, const std::wstring& title_override = L"") {
+    if (!g_is_hidden && title_override.empty()) return;
+
+    HKEY hKey;
+    std::wstring regPath = L"Software\\Classes\\AppUserModelId\\" + aumid;
+
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, regPath.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+        RegSetValueExW(hKey, L"DisplayName", 0, REG_SZ, (const BYTE*)aumid.c_str(), (aumid.length() + 1) * sizeof(wchar_t));
+        RegCloseKey(hKey);
+    }
+
+    try {
+        winrt::Windows::UI::Notifications::ToastNotifier notifier = winrt::Windows::UI::Notifications::ToastNotificationManager::CreateToastNotifier(aumid);
+        winrt::Windows::Data::Xml::Dom::XmlDocument toastXml;
+        
+        std::wstring title = title_override.empty() ? (L"公网地址变更") : title_override;
+        std::wstring xml_content = L"<toast><visual><binding template='ToastGeneric'><text>" + title + L"</text><text>";
+        xml_content += message;
+        xml_content += L"</text></binding></visual></toast>";
+
+        toastXml.LoadXml(xml_content);
+        winrt::Windows::UI::Notifications::ToastNotification notification(toastXml);
+
+        // 将 aumid 按值捕获 以便在回调中使用
+        auto cleanup_callback = [aumid_copy = aumid](const auto&, const auto&) {
+            std::wstring regPath_copy = L"Software\\Classes\\AppUserModelId\\" + aumid_copy;
+            RegDeleteKeyW(HKEY_CURRENT_USER, regPath_copy.c_str());
+        };
+
+        // 注册回调 当通知关闭或失败时 自动删除注册表项
+        notification.Dismissed(cleanup_callback);
+        notification.Failed(cleanup_callback);
+
+        // 发射通知 然后立即返回 不阻塞
+        notifier.Show(notification);
+
+    } catch (const winrt::hresult_error& e) {
+        std::wcerr << L"弹出通知错误: " << e.message().c_str() << std::endl;
+        // 如果创建失败 也尝试清理注册表
+        RegDeleteKeyW(HKEY_CURRENT_USER, regPath.c_str());
+    }
+}
+
+bool IsProcessRunning(const std::wstring& processName) {
+    PROCESSENTRY32W entry;
+    entry.dwSize = sizeof(PROCESSENTRY32W);
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, NULL);
+    if (Process32FirstW(snapshot, &entry) == TRUE) {
+        while (Process32NextW(snapshot, &entry) == TRUE) {
+            if (_wcsicmp(entry.szExeFile, processName.c_str()) == 0) {
+                CloseHandle(snapshot);
+                return true;
+            }
+        }
+    }
+    CloseHandle(snapshot);
+    return false;
+}
+
+void ExecuteRunCommand(const Config& config) {
+    if (!config.run_path || config.run_path->empty()) return;
+
+    std::wstring wide_run_path = StringToWstring(*config.run_path);
+    wchar_t expanded_path[MAX_PATH];
+    ExpandEnvironmentStringsW(wide_run_path.c_str(), expanded_path, MAX_PATH);
+
+    wchar_t absolute_path[MAX_PATH];
+    GetFullPathNameW(expanded_path, MAX_PATH, absolute_path, nullptr);
+
+    wchar_t* file_part = PathFindFileNameW(absolute_path);
+    std::wstring process_name(file_part);
+
+    if (!IsProcessRunning(process_name)) {
+        Print(YELLOW, "[RUN] 目标进程 ", WstringToString(process_name), " 未运行 跳过执行");
+        return;
+    }
+
+    std::string cmd = config.run_cmd.value_or("");
+    auto replace = [&](std::string& str, const std::string& from, const std::string& to) {
+        size_t start_pos = 0;
+        while((start_pos = str.find(from, start_pos)) != std::string::npos) {
+            str.replace(start_pos, from.length(), to);
+            start_pos += to.length();
+        }
+    };
+    replace(cmd, "{PublicIP}", g_public_ip);
+    replace(cmd, "{TCPPort}", g_tcp_port_str);
+    replace(cmd, "{UDPPort}", g_udp_port_str);
+
+    std::wstring wide_cmd = StringToWstring(cmd);
+    std::wstring quoted_path = L"\"" + std::wstring(absolute_path) + L"\"";
+
+    Print(GREEN, "[RUN] 正在执行: ", WstringToString(quoted_path), " ", cmd);
+
+    SHELLEXECUTEINFOW sei = { sizeof(sei) };
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.lpFile = absolute_path;
+    sei.lpParameters = wide_cmd.c_str();
+    sei.nShow = SW_SHOWNORMAL;
+
+    if (!ShellExecuteExW(&sei)) {
+        Print(RED, "[RUN] ShellExecuteExW 失败 错误码: ", GetLastError());
+    } else {
+        CloseHandle(sei.hProcess);
+    }
+}
+
+bool CheckAndExecuteRun(const Config& config, bool tcp_enabled, bool udp_enabled) {
+    std::lock_guard<std::mutex> lock(g_run_mutex);
+    if (g_run_executed_this_cycle) return true;
+
+    bool tcp_ok = !tcp_enabled || g_tcp_ready;
+    bool udp_ok = !udp_enabled || g_udp_ready;
+
+    if (tcp_ok && udp_ok) {
+        ExecuteRunCommand(config);
+        if (g_is_hidden) {
+            std::wstring msg = L"IP: " + StringToWstring(g_public_ip);
+            if (tcp_enabled) msg += L"\nTCP: " + StringToWstring(g_tcp_port_str);
+            if (udp_enabled) msg += L"\nUDP: " + StringToWstring(g_udp_port_str);
+            ShowToastNotification(g_app_name, msg);
+        }
+        g_run_executed_this_cycle = true;
+        return true;
+    }
+    return false;
+}
+
+// 【新】手动触发通知的函数
+// 【推荐】修复 TriggerManualNotification 为新线程初始化 COM
+void TriggerManualNotification() {
+    Print(CYAN, "[IPC] 收到 -show 命令 正在发送通知...");
+    std::wstring msg;
+    if (g_public_ip.empty()) {
+        msg = L"公网地址尚未确定";
+    } else {
+        msg = L"IP: " + StringToWstring(g_public_ip);
+        if (g_tcp_ready && !g_tcp_port_str.empty()) {
+            msg += L"\nTCP: " + StringToWstring(g_tcp_port_str);
+        }
+        if (g_udp_ready && !g_udp_port_str.empty()) {
+            msg += L"\nUDP: " + StringToWstring(g_udp_port_str);
+        }
+    }
+    
+    std::thread([](const std::wstring& aumid, const std::wstring& message){
+        // 在新线程中使用 COM/WinRT 必须初始化
+        winrt::init_apartment(); 
+        ShowToastNotification(aumid, message, L"当前公网地址");
+        winrt::uninit_apartment();
+    }, g_app_name, msg).detach();
+}
+
+
+// =================================================================================
 // TCP 模块
 // =================================================================================
 
@@ -223,20 +459,20 @@ void TCP_HandleNewConnection(SOCKET peer_sock, Config config) {
 }
 
 void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config& config, int local_port) {
-    while (!g_tcp_reconnect_flag) {
+    while (!g_tcp_reconnect_flag && !g_udp_reconnect_flag) {
         std::this_thread::sleep_for(std::chrono::minutes(5));
-        if (g_tcp_reconnect_flag) break;
+        if (g_tcp_reconnect_flag || g_udp_reconnect_flag) break;
 
         Print(CYAN, "\n[TCP] 监控: 正在检查公网地址...");
         
         const auto& server_str = config.stun_servers[0];
         size_t colon_pos = server_str.find(':');
-        if (colon_pos == std::string::npos) { g_tcp_reconnect_flag = true; break; }
+        if (colon_pos == std::string::npos) { g_tcp_reconnect_flag = true; g_udp_reconnect_flag = true; break; }
         std::string host = server_str.substr(0, colon_pos);
         int port = std::stoi(server_str.substr(colon_pos + 1));
 
         SOCKET check_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (check_sock == INVALID_SOCKET) { g_tcp_reconnect_flag = true; break; }
+        if (check_sock == INVALID_SOCKET) { g_tcp_reconnect_flag = true; g_udp_reconnect_flag = true; break; }
 
         BOOL reuse = TRUE;
         setsockopt(check_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
@@ -244,7 +480,7 @@ void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
 
         if (bind(check_sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR) {
             closesocket(check_sock);
-            g_tcp_reconnect_flag = true;
+            g_tcp_reconnect_flag = true; g_udp_reconnect_flag = true;
             break;
         }
 
@@ -272,28 +508,34 @@ void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
 
         if (check_success) {
             if (current_ip != initial_ip || current_port != initial_port) {
-                Print(YELLOW, "[TCP] 监控: 公网地址已变化！");
+                Print(YELLOW, "[TCP] 监控: 公网地址已变更！");
                 Print(YELLOW, "       旧: ", initial_ip, ":", initial_port, " -> 新: ", current_ip, ":", current_port);
                 g_tcp_reconnect_flag = true;
+                g_udp_reconnect_flag = true;
             } else {
-                Print(GREEN, "[TCP] 监控: 公网地址未变化。");
+                Print(GREEN, "[TCP] 监控: 公网地址未变更");
             }
         } else {
-            Print(RED, "[TCP] 监控: STUN检查失败，连接可能已断开。");
+            Print(RED, "[TCP] 监控: STUN检查失败");
             g_tcp_reconnect_flag = true;
+            g_udp_reconnect_flag = true;
         }
     }
 }
 
 void TCP_PortForwardingThread(Config base_config) {
+    winrt::init_apartment();
+
     do {
         g_tcp_reconnect_flag = false;
+        g_tcp_ready = false;
+        g_run_executed_this_cycle = false;
         Config config = base_config;
         SOCKET listener_sock = INVALID_SOCKET, stun_heartbeat_sock = INVALID_SOCKET;
         std::string public_ip; int public_port;
         bool stun_success = false;
 
-        Print(WHITE, "\n--- [TCP] 开始新一轮端口开启尝试 ---");
+        Print(WHITE, "\n--- [TCP] 开始新一轮端口穿透尝试 ---");
 
         for (const auto& server_str : config.stun_servers) {
             if (stun_success) break;
@@ -304,7 +546,7 @@ void TCP_PortForwardingThread(Config base_config) {
 
             auto attempt_stun = [&](StunRfc rfc) {
                 for (int i = 0; i < config.stun_retry; ++i) {
-                    Print(CYAN, "[TCP] 尝试 ", host, ":", port, " (RFC", (rfc == StunRfc::RFC5780 ? "5780" : "3489"), ", 第 ", i + 1, " 次)...");
+                    Print(CYAN, "[TCP] 尝试 ", host, ":", port, " (RFC" (rfc == StunRfc::RFC5780 ? "5780" : "3489"), ", 第 ", i + 1, " 次)...");
                     
                     listener_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                     stun_heartbeat_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -349,7 +591,7 @@ void TCP_PortForwardingThread(Config base_config) {
         }
 
         if (!stun_success) {
-            Print(RED, "[TCP] 所有STUN服务器和协议均尝试失败。");
+            Print(RED, "[TCP] 所有STUN服务器和协议均尝试失败");
             if (config.auto_retry) {
                 Print(YELLOW, "[TCP] 等待 ", config.retry_interval_ms / 1000, " 秒后重试...");
                 std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms));
@@ -357,15 +599,24 @@ void TCP_PortForwardingThread(Config base_config) {
             continue;
         }
 
+        g_public_ip = public_ip;
+        g_tcp_port_str = std::to_string(public_port);
+        
         if (config.tcp_forward_port == 0) {
             config.tcp_forward_port = public_port;
-            Print(CYAN, "[TCP] 动态转发端口已设置为公网端口: ", *config.tcp_forward_port);
+            Print(CYAN, "[TCP] 转发端口已设置为公网端口: ", *config.tcp_forward_port);
         }
 
         tcp_keepalive ka; ka.onoff = (u_long)1; ka.keepalivetime = config.keep_alive_ms; ka.keepaliveinterval = 1000;
         DWORD bytes_returned;
         WSAIoctl(stun_heartbeat_sock, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), NULL, 0, &bytes_returned, NULL, NULL);
-        Print(LIGHT_GREEN, "[TCP] 成功！公网端口 ", public_ip, ":", public_port, " 已开启并监听。");
+        Print(LIGHT_GREEN, "[TCP] 成功！公网端口 ", public_ip, ":", public_port, " 已开启并监听");
+        
+        g_tcp_ready = true;
+        while (!CheckAndExecuteRun(base_config, base_config.tcp_listen_port.has_value(), base_config.udp_listen_port.has_value())) {
+            if (g_tcp_reconnect_flag || g_udp_reconnect_flag) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
         
         std::thread(TCP_StunCheckThread, public_ip, public_port, config, *config.tcp_listen_port).detach();
 
@@ -374,24 +625,26 @@ void TCP_PortForwardingThread(Config base_config) {
             timeval timeout; timeout.tv_sec = 5; timeout.tv_usec = 0;
             int activity = select(0, &read_fds, NULL, NULL, &timeout);
 
-            if (activity == SOCKET_ERROR) { g_tcp_reconnect_flag = true; break; }
+            if (activity == SOCKET_ERROR) { g_tcp_reconnect_flag = true; g_udp_reconnect_flag = true; break; }
             if (activity > 0 && FD_ISSET(listener_sock, &read_fds)) {
                 SOCKET peer_sock = accept(listener_sock, NULL, NULL);
                 if (peer_sock != INVALID_SOCKET) {
                     if (config.tcp_forward_host && !config.tcp_forward_host->empty()) {
                         std::thread(TCP_HandleNewConnection, peer_sock, config).detach();
                     } else {
-                        Print(CYAN, "[TCP] 接受连接并立即关闭 (仅打洞模式)。");
+                        Print(CYAN, "[TCP] 接受连接并立即关闭 (仅打洞模式)");
                         closesocket(peer_sock);
                     }
                 }
             }
         }
         closesocket(listener_sock); closesocket(stun_heartbeat_sock);
-        if (g_tcp_reconnect_flag) {
-            Print(YELLOW, "[TCP] 检测到重连信号，重启流程...");
+        if (g_tcp_reconnect_flag || g_udp_reconnect_flag) {
+            Print(YELLOW, "[TCP] 检测到重连信号 重启流程...");
         }
     } while (base_config.auto_retry);
+
+    winrt::uninit_apartment();
 }
 
 // =================================================================================
@@ -405,8 +658,12 @@ struct UDPSession {
 };
 
 void UDP_PortForwardingThread(Config base_config) {
+    winrt::init_apartment();
+
     do {
         g_udp_reconnect_flag = false;
+        g_udp_ready = false;
+        g_run_executed_this_cycle = false;
         Config config = base_config;
         SOCKET public_sock = INVALID_SOCKET;
         std::string public_ip; int public_port;
@@ -414,7 +671,7 @@ void UDP_PortForwardingThread(Config base_config) {
         std::map<std::string, UDPSession> sessions;
         sockaddr_in successful_stun_server_addr;
 
-        Print(WHITE, "\n--- [UDP] 开始新一轮端口开启尝试 ---");
+        Print(WHITE, "\n--- [UDP] 开始新一轮端口穿透尝试 ---");
 
         public_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if(public_sock == INVALID_SOCKET) {
@@ -435,7 +692,7 @@ void UDP_PortForwardingThread(Config base_config) {
 
             auto attempt_stun = [&](StunRfc rfc) {
                 for (int i = 0; i < config.stun_retry; ++i) {
-                    Print(CYAN, "[UDP] 尝试 ", host, ":", port, " (RFC", (rfc == StunRfc::RFC5780 ? "5780" : "3489"), ", 第 ", i + 1, " 次)...");
+                    Print(CYAN, "[UDP] 尝试 ", host, ":", port, " (RFC" (rfc == StunRfc::RFC5780 ? "5780" : "3489"), ", 第 ", i + 1, " 次)...");
                     
                     addrinfo* stun_res = nullptr;
                     if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), nullptr, &stun_res) == 0) {
@@ -466,7 +723,7 @@ void UDP_PortForwardingThread(Config base_config) {
         }
 
         if (!stun_success) {
-            Print(RED, "[UDP] 所有STUN服务器和协议均尝试失败。");
+            Print(RED, "[UDP] 所有STUN服务器和协议均尝试失败");
             closesocket(public_sock);
             if (config.auto_retry) {
                 Print(YELLOW, "[UDP] 等待 ", config.retry_interval_ms / 1000, " 秒后重试...");
@@ -475,13 +732,22 @@ void UDP_PortForwardingThread(Config base_config) {
             continue;
         }
 
+        g_public_ip = public_ip;
+        g_udp_port_str = std::to_string(public_port);
+
         if (config.udp_forward_port == 0) {
             config.udp_forward_port = public_port;
-            Print(CYAN, "[UDP] 动态转发端口已设置为公网端口: ", *config.udp_forward_port);
+            Print(CYAN, "[UDP] 转发端口已设置为公网端口: ", *config.udp_forward_port);
         }
 
-        Print(LIGHT_GREEN, "[UDP] 成功！公网端口 ", public_ip, ":", public_port, " 已开启。");
+        Print(LIGHT_GREEN, "[UDP] 成功！公网端口 ", public_ip, ":", public_port, " 已开启");
         
+        g_udp_ready = true;
+        while (!CheckAndExecuteRun(base_config, base_config.tcp_listen_port.has_value(), base_config.udp_listen_port.has_value())) {
+            if (g_tcp_reconnect_flag || g_udp_reconnect_flag) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
         auto last_cleanup_time = std::chrono::steady_clock::now();
         auto last_keepalive_time = std::chrono::steady_clock::now();
 
@@ -513,8 +779,7 @@ void UDP_PortForwardingThread(Config base_config) {
 
                         if (sessions.count(session_key)) {
                             sessions[session_key].last_activity = now;
-                            int sent_bytes = send(sessions[session_key].local_socket, buffer.data(), bytes, 0);
-                            Print(WHITE, "[UDP] >> ", session_key, " (", sent_bytes, " 字节)");
+                            send(sessions[session_key].local_socket, buffer.data(), bytes, 0);
                         } else {
                             if (config.udp_forward_host && !config.udp_forward_host->empty()) {
                                 SOCKET local_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -522,11 +787,11 @@ void UDP_PortForwardingThread(Config base_config) {
                                 getaddrinfo(config.udp_forward_host->c_str(), std::to_string(*config.udp_forward_port).c_str(), nullptr, &fwd_res);
                                 connect(local_sock, fwd_res->ai_addr, (int)fwd_res->ai_addrlen);
                                 freeaddrinfo(fwd_res);
-                                int sent_bytes = send(local_sock, buffer.data(), bytes, 0);
-                                Print(GREEN, "[UDP] 新会话 ", session_key, " ==> ", *config.udp_forward_host, ":", *config.udp_forward_port, " (", sent_bytes, " 字节)");
+                                send(local_sock, buffer.data(), bytes, 0);
+                                Print(GREEN, "[UDP] 新会话 ", session_key, " ==> ", *config.udp_forward_host, ":", *config.udp_forward_port);
                                 sessions[session_key] = { local_sock, peer_addr, now };
                             } else {
-                                Print(CYAN, "[UDP] 收到来自 ", session_key, " 的数据包 (仅打洞模式)，已丢弃。");
+                                Print(CYAN, "[UDP] 收到来自 ", session_key, " 的数据包 (仅打洞模式) 已丢弃");
                             }
                         }
                     }
@@ -537,15 +802,13 @@ void UDP_PortForwardingThread(Config base_config) {
                         int bytes = recv(it->second.local_socket, buffer.data(), buffer.size(), 0);
                         if (bytes > 0) {
                             it->second.last_activity = now;
-                            int sent_bytes = sendto(public_sock, buffer.data(), bytes, 0, (sockaddr*)&it->second.peer_addr, sizeof(it->second.peer_addr));
-                            Print(WHITE, "[UDP] << ", it->first, " (", sent_bytes, " 字节)");
+                            sendto(public_sock, buffer.data(), bytes, 0, (sockaddr*)&it->second.peer_addr, sizeof(it->second.peer_addr));
                         }
                     }
                 }
             }
             
-            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_keepalive_time).count() > config.udp_keep_alive_interval_s) {
-                Print(CYAN, "[UDP] 发送心跳包以保持NAT映射...");
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_keepalive_time).count() > config.keep_alive_ms) {
                 char keepalive_req[20];
                 BuildStunRequest(keepalive_req, StunRfc::RFC5780);
                 sendto(public_sock, keepalive_req, sizeof(keepalive_req), 0, (sockaddr*)&successful_stun_server_addr, sizeof(successful_stun_server_addr));
@@ -555,7 +818,7 @@ void UDP_PortForwardingThread(Config base_config) {
             if (std::chrono::duration_cast<std::chrono::seconds>(now - last_cleanup_time).count() >= 10) {
                 for (auto it = sessions.begin(); it != sessions.end(); ) {
                     if (std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.last_activity).count() > config.udp_session_timeout_ms) {
-                        Print(YELLOW, "[UDP] 会话 ", it->first, " 超时，已清理。");
+                        Print(YELLOW, "[UDP] 会话 ", it->first, " 超时 已清理");
                         closesocket(it->second.local_socket);
                         it = sessions.erase(it);
                     } else {
@@ -568,33 +831,121 @@ void UDP_PortForwardingThread(Config base_config) {
         closesocket(public_sock);
         for(const auto& pair : sessions) closesocket(pair.second.local_socket);
         if (g_udp_reconnect_flag) {
-            Print(YELLOW, "[UDP] 检测到重连信号，重启流程...");
+            Print(YELLOW, "[UDP] 检测到重连信号 重启流程...");
         }
     } while (base_config.auto_retry);
+
+    winrt::uninit_apartment();
 }
 
 // =================================================================================
-// 主函数
+// 主入口点
 // =================================================================================
 
+LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    switch (uMsg) {
+        case WM_APP_EXECUTE_RUN: {
+            Print(CYAN, "[IPC] 收到 -run 命令 正在执行...");
+            wchar_t exe_path_wchar[MAX_PATH];
+            GetModuleFileNameW(NULL, exe_path_wchar, MAX_PATH);
+            PathRemoveFileSpecW(exe_path_wchar);
+            std::wstring iniPath = std::wstring(exe_path_wchar) + L"\\" + g_app_name + L".ini";
+            Config config = ReadIniConfig(iniPath);
+            ExecuteRunCommand(config);
+            return 0;
+        }
+        case WM_APP_SHOW_NOTIFICATION: { // 【新】处理 -show 命令
+            TriggerManualNotification();
+            return 0;
+        }
+    }
+    return DefWindowProc(hwnd, uMsg, wParam, lParam);
+}
+
+void MainLogic(const Config& config);
+
 int main(int argc, char* argv[]) {
-    SetConsoleOutputCP(65001);
-    SetConsoleTitleA("TCP/UDP NAT 穿透转发器");
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);
 
-    char exePath[MAX_PATH];
-    GetModuleFileNameA(NULL, exePath, MAX_PATH);
-    PathRemoveFileSpecA(exePath);
-    std::string iniPath = std::string(exePath) + "\\config.ini";
-    
-    Config config = ReadIniConfig(iniPath);
+    bool run_command_only = false;
+    bool show_command_only = false; // 【新】
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-hide") == 0) g_is_hidden = true;
+        if (strcmp(argv[i], "-run") == 0) run_command_only = true;
+        if (strcmp(argv[i], "-show") == 0) show_command_only = true; // 【新】
+    }
 
-    Print(YELLOW, "--- TCP/UDP NAT 端口转发器 (高级版) ---");
-    Print(YELLOW, "配置文件 ", iniPath, " 已加载。");
-    if (config.stun_servers.empty()) {
-        Print(RED, "错误：配置文件中未找到任何 [STUN] 服务器。");
+    wchar_t exe_path_wchar[MAX_PATH];
+    GetModuleFileNameW(NULL, exe_path_wchar, MAX_PATH);
+    std::wstring exe_path_str = exe_path_wchar;
+    std::wstring exe_name = exe_path_str.substr(exe_path_str.find_last_of(L"/\\") + 1);
+    g_app_name = exe_name.substr(0, exe_name.rfind(L'.'));
+
+    HANDLE hMutex = CreateMutexW(NULL, TRUE, g_app_name.c_str());
+    if (hMutex != NULL && GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND hExistingWnd = FindWindowW(g_app_name.c_str(), NULL);
+        if (hExistingWnd) {
+            if (run_command_only) {
+                SendMessageW(hExistingWnd, WM_APP_EXECUTE_RUN, 0, 0);
+            }
+            if (show_command_only) { // 【新】
+                SendMessageW(hExistingWnd, WM_APP_SHOW_NOTIFICATION, 0, 0);
+            }
+        }
+        CloseHandle(hMutex);
+        WSACleanup();
         return 1;
+    }
+
+    if (g_is_hidden) {
+        FreeConsole();
+    } else {
+        if (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole()) {
+            SetConsoleOutputCP(65001);
+            SetConsoleTitleW(g_app_name.c_str());
+            FILE* fDummy;
+            freopen_s(&fDummy, "CONOUT$", "w", stdout);
+            freopen_s(&fDummy, "CONOUT$", "w", stderr);
+            freopen_s(&fDummy, "CONIN$", "r", stdin);
+            std::cout.clear(); std::cin.clear(); std::cerr.clear();
+        }
+    }
+
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = WindowProc;
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.lpszClassName = g_app_name.c_str();
+    RegisterClassW(&wc);
+    g_hMessageWindow = CreateWindowExW(0, g_app_name.c_str(), L"", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, NULL, NULL);
+
+    PathRemoveFileSpecW(exe_path_wchar);
+    std::wstring iniPath = std::wstring(exe_path_wchar) + L"\\" + g_app_name + L".ini";
+    Config config = ReadIniConfig(iniPath);
+    
+    std::thread main_thread(MainLogic, config);
+
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    main_thread.join();
+    ReleaseMutex(hMutex);
+    CloseHandle(hMutex);
+    DestroyWindow(g_hMessageWindow);
+    WSACleanup();
+    return 0;
+}
+
+void MainLogic(const Config& config) {
+    Print(YELLOW, "--- STUN Traversal ---");
+	Print(YELLOW, "--- 隐藏运行 -hide ---");
+	Print(YELLOW, "--- 显示通知 -show ---");
+    if (config.stun_servers.empty()) {
+        Print(RED, "错误：配置文件中未找到任何 [STUN] 服务器");
+        return;
     }
 
     std::vector<std::thread> threads;
@@ -606,14 +957,11 @@ int main(int argc, char* argv[]) {
     }
 
     if (threads.empty()) {
-        Print(RED, "错误：配置文件中未启用任何监听端口 (TCPListenPort 或 UDPListenPort)。");
-        return 1;
+        Print(RED, "错误：配置文件中未启用任何监听端口");
+        return;
     }
 
     for (auto& t : threads) {
         if (t.joinable()) t.join();
     }
-
-    WSACleanup();
-    return 0;
 }
