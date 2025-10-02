@@ -19,8 +19,8 @@
 #include <mstcpip.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
+#include <shobjidl.h> // For AUMID
 
-// For Toast Notifications
 #include <winrt/Windows.UI.Notifications.h>
 #include <winrt/Windows.Data.Xml.Dom.h>
 
@@ -29,6 +29,7 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "windowsapp.lib")
+#pragma comment(lib, "ole32.lib") // For AUMID
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup")
 
 // =================================================================================
@@ -805,6 +806,7 @@ void MainLogic(const Config& config);
 int main(int argc, char* argv[]) {
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);
+    SetCurrentProcessExplicitAppUserModelID(L"NATForwarder");
 
     bool run_command_only = false;
     for (int i = 1; i < argc; ++i) {
