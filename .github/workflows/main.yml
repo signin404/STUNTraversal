@@ -20,15 +20,15 @@ jobs:
       uses: ilammy/msvc-dev-cmd@v1
 
     - name: Compile C++ code
-      run: cl.exe STUNTraversal.cpp /std:c++17 /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 /Fe:udp_forwarder.exe /link Ws2_32.lib Shlwapi.lib
+      run: cl.exe STUNTraversal.cpp /std:c++17 /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 /Fe:STUNTraversal.exe /link Ws2_32.lib Shlwapi.lib
 
     - name: Prepare artifact for upload
       run: |
         mkdir release
-        copy udp_forwarder.exe release\
+        copy STUNTraversal.exe release\
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: udp-forwarder-windows
+        name: STUNTraversal
         path: release/
