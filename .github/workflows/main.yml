@@ -1,4 +1,4 @@
-name: Build C++ UDP Forwarder for Windows
+name: Build C++ UDP Forwarder for Windows (using MSYS2)
 
 on:
   push:
@@ -15,18 +15,31 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Setup MSVC Developer Command Prompt
-      uses: ilammy/msvc-dev-cmd@v1
+    - name: Set up MSYS2 and MinGW-w64
+      # 使用官方推荐的、更稳定的 MSYS2 action
+      uses: msys2/setup-msys2@v2
+      with:
+        # 指定我们要使用 MINGW64 环境 (提供64位 g++)
+        msystem: MINGW64
+        # 更新包数据库
+        update: true
+        # 安装完整的 C++ 编译器工具链
+        install: >-
+          mingw-w64-x86_64-toolchain
 
-    - name: Compile C++ code
-      # 使用静态链接运行时库，确保可移植性
-      run: cl.exe forwarder_punch.cpp /std:c++17 /EHsc /O2 /MT /Fe:udp_forwarder.exe /link Ws2_32.lib Shlwapi.lib
+    - name: Compile C++ code with GCC
+      # 关键：使用 msys2 shell 来执行编译命令
+      # 这确保了 g++ 命令在正确的环境中被找到和执行
+      shell: msys2 {0}
+      run: g++ -std=c++17 -o udp_forwarder.exe forwarder_punch.cpp -lws2_32 -lshlwapi -static -pthread
 
     - name: Prepare artifact for upload
+      # 同样使用 msys2 shell 来执行打包命令
+      shell: msys2 {0}
       run: |
-        mkdir release
-        copy udp_forwarder.exe release\
-        copy config.ini release\
+        mkdir -p release
+        cp udp_forwarder.exe release/
+        cp config.ini release/
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
