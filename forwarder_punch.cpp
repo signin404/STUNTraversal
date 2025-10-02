@@ -359,7 +359,7 @@ void TCP_PortForwardingThread(Config base_config) {
 
         if (config.tcp_forward_port == 0) {
             config.tcp_forward_port = public_port;
-            Print(CYAN, "[TCP] 动态转发端口已设置为: ", *config.tcp_forward_port);
+            Print(CYAN, "[TCP] 动态转发端口已设置为公网端口: ", *config.tcp_forward_port);
         }
 
         tcp_keepalive ka; ka.onoff = (u_long)1; ka.keepalivetime = config.keep_alive_ms; ka.keepaliveinterval = 1000;
@@ -477,7 +477,7 @@ void UDP_PortForwardingThread(Config base_config) {
 
         if (config.udp_forward_port == 0) {
             config.udp_forward_port = public_port;
-            Print(CYAN, "[UDP] 动态转发端口已设置为: ", *config.udp_forward_port);
+            Print(CYAN, "[UDP] 动态转发端口已设置为公网端口: ", *config.udp_forward_port);
         }
 
         Print(LIGHT_GREEN, "[UDP] 成功！公网端口 ", public_ip, ":", public_port, " 已开启。");
@@ -513,16 +513,17 @@ void UDP_PortForwardingThread(Config base_config) {
 
                         if (sessions.count(session_key)) {
                             sessions[session_key].last_activity = now;
-                            send(sessions[session_key].local_socket, buffer.data(), bytes, 0);
+                            int sent_bytes = send(sessions[session_key].local_socket, buffer.data(), bytes, 0);
+                            Print(WHITE, "[UDP] >> ", session_key, " (", sent_bytes, " 字节)");
                         } else {
                             if (config.udp_forward_host && !config.udp_forward_host->empty()) {
-                                Print(GREEN, "[UDP] 来自 ", session_key, " 的新会话。");
                                 SOCKET local_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
                                 addrinfo* fwd_res = nullptr;
                                 getaddrinfo(config.udp_forward_host->c_str(), std::to_string(*config.udp_forward_port).c_str(), nullptr, &fwd_res);
                                 connect(local_sock, fwd_res->ai_addr, (int)fwd_res->ai_addrlen);
                                 freeaddrinfo(fwd_res);
-                                send(local_sock, buffer.data(), bytes, 0);
+                                int sent_bytes = send(local_sock, buffer.data(), bytes, 0);
+                                Print(GREEN, "[UDP] 新会话 ", session_key, " ==> ", *config.udp_forward_host, ":", *config.udp_forward_port, " (", sent_bytes, " 字节)");
                                 sessions[session_key] = { local_sock, peer_addr, now };
                             } else {
                                 Print(CYAN, "[UDP] 收到来自 ", session_key, " 的数据包 (仅打洞模式)，已丢弃。");
@@ -536,7 +537,8 @@ void UDP_PortForwardingThread(Config base_config) {
                         int bytes = recv(it->second.local_socket, buffer.data(), buffer.size(), 0);
                         if (bytes > 0) {
                             it->second.last_activity = now;
-                            sendto(public_sock, buffer.data(), bytes, 0, (sockaddr*)&it->second.peer_addr, sizeof(it->second.peer_addr));
+                            int sent_bytes = sendto(public_sock, buffer.data(), bytes, 0, (sockaddr*)&it->second.peer_addr, sizeof(it->second.peer_addr));
+                            Print(WHITE, "[UDP] << ", it->first, " (", sent_bytes, " 字节)");
                         }
                     }
                 }
