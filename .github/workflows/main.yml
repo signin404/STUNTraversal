@@ -5,7 +5,6 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
-  # 允许手动触发工作流
   workflow_dispatch:
 
 jobs:
@@ -20,8 +19,8 @@ jobs:
       uses: ilammy/msvc-dev-cmd@v1
 
     - name: Compile C++ code
-      # 修正编译命令
-      run: cl.exe forwarder_punch.cpp /std:c++17 /EHsc /O2 /MD /Fe:udp_forwarder.exe /link Ws2_32.lib Shlwapi.lib
+      # 使用静态链接运行时库，确保可移植性
+      run: cl.exe forwarder_punch.cpp /std:c++17 /EHsc /O2 /MT /Fe:udp_forwarder.exe /link Ws2_32.lib Shlwapi.lib
 
     - name: Prepare artifact for upload
       run: |
