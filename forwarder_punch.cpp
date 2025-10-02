@@ -10,6 +10,7 @@
 #include <fstream>
 #include <sstream>
 #include <atomic>
+#include <mutex>
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -26,12 +27,23 @@
 
 std::atomic<bool> g_tcp_reconnect_flag{false};
 std::atomic<bool> g_udp_reconnect_flag{false};
+std::mutex g_cout_mutex;
 
 enum class StunRfc { RFC3489, RFC5780 };
 
 enum ConsoleColor { DARKBLUE = 1, GREEN = 2, CYAN = 3, RED = 4, MAGENTA = 5, YELLOW = 6, WHITE = 7, GRAY = 8, LIGHT_GREEN = 10 };
-HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-void SetColor(ConsoleColor color) { SetConsoleTextAttribute(hConsole, color); }
+void SetColor(ConsoleColor color) { 
+    std::lock_guard<std::mutex> lock(g_cout_mutex);
+    SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), color); 
+}
+
+// 模板化的打印函数，确保线程安全
+template<typename... Args>
+void Print(ConsoleColor color, Args&&... args) {
+    std::lock_guard<std::mutex> lock(g_cout_mutex);
+    SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), color);
+    (std::cout << ... << args) << std::endl;
+}
 
 std::string trim(const std::string& s) {
     size_t first = s.find_first_not_of(" \t\r\n");
@@ -212,18 +224,16 @@ void TCP_HandleNewConnection(SOCKET peer_sock, Config config) {
     getpeername(peer_sock, (sockaddr*)&peer_addr, &peer_addr_len);
     char peer_ip_str[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &peer_addr.sin_addr, peer_ip_str, sizeof(peer_ip_str));
-    SetColor(GREEN);
-    std::cout << "[TCP] 新连接来自 " << peer_ip_str << ":" << ntohs(peer_addr.sin_port) << std::endl;
+    Print(GREEN, "[TCP] 新连接来自 ", peer_ip_str, ":", ntohs(peer_addr.sin_port));
+    
     SOCKET target_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     addrinfo* fwd_res = nullptr;
     getaddrinfo(config.tcp_forward_host->c_str(), std::to_string(*config.tcp_forward_port).c_str(), nullptr, &fwd_res);
     if (connect(target_sock, fwd_res->ai_addr, (int)fwd_res->ai_addrlen) == SOCKET_ERROR) {
-        SetColor(RED);
-        std::cerr << "[TCP] 无法连接本地目标 " << *config.tcp_forward_host << ":" << *config.tcp_forward_port << std::endl;
+        Print(RED, "[TCP] 无法连接本地目标 ", *config.tcp_forward_host, ":", *config.tcp_forward_port);
         closesocket(peer_sock);
     } else {
-        SetColor(YELLOW);
-        std::cout << "[TCP] 开始转发 " << peer_ip_str << " <==> " << *config.tcp_forward_host << ":" << *config.tcp_forward_port << std::endl;
+        Print(YELLOW, "[TCP] 开始转发 ", peer_ip_str, " <==> ", *config.tcp_forward_host, ":", *config.tcp_forward_port);
         std::thread(TCP_Proxy, peer_sock, target_sock, config.keep_alive_ms).detach();
         std::thread(TCP_Proxy, target_sock, peer_sock, config.keep_alive_ms).detach();
     }
@@ -235,23 +245,19 @@ void TCP_StunCheckThread(SOCKET sock, std::string initial_ip, int initial_port, 
         std::this_thread::sleep_for(std::chrono::minutes(5));
         if (g_tcp_reconnect_flag) break;
 
-        SetColor(CYAN);
-        std::cout << "\n[TCP] 监控: 正在检查公网地址..." << std::endl;
+        Print(CYAN, "\n[TCP] 监控: 正在检查公网地址...");
         std::string current_ip; int current_port;
         if (GetPublicEndpoint(sock, StunRfc::RFC5780, config.punch_timeout_ms, current_ip, current_port)) {
             if (current_ip != initial_ip || current_port != initial_port) {
-                SetColor(YELLOW);
-                std::cout << "[TCP] 监控: 公网地址已变化！" << std::endl;
-                std::cout << "       旧: " << initial_ip << ":" << initial_port << " -> 新: " << current_ip << ":" << current_port << std::endl;
+                Print(YELLOW, "[TCP] 监控: 公网地址已变化！");
+                Print(YELLOW, "       旧: ", initial_ip, ":", initial_port, " -> 新: ", current_ip, ":", current_port);
                 g_tcp_reconnect_flag = true;
                 break;
             } else {
-                SetColor(GREEN);
-                std::cout << "[TCP] 监控: 公网地址未变化。" << std::endl;
+                Print(GREEN, "[TCP] 监控: 公网地址未变化。");
             }
         } else {
-            SetColor(RED);
-            std::cerr << "[TCP] 监控: STUN检查失败，连接可能已断开。" << std::endl;
+            Print(RED, "[TCP] 监控: STUN检查失败，连接可能已断开。");
             g_tcp_reconnect_flag = true;
             break;
         }
@@ -266,7 +272,7 @@ void TCP_PortForwardingThread(Config base_config) {
         std::string public_ip; int public_port;
         bool stun_success = false;
 
-        SetColor(WHITE); std::cout << "\n--- [TCP] 开始新一轮端口开启尝试 ---" << std::endl;
+        Print(WHITE, "\n--- [TCP] 开始新一轮端口开启尝试 ---");
 
         for (const auto& server_str : config.stun_servers) {
             if (stun_success) break;
@@ -277,7 +283,7 @@ void TCP_PortForwardingThread(Config base_config) {
 
             auto attempt_stun = [&](StunRfc rfc) {
                 for (int i = 0; i < config.stun_retry; ++i) {
-                    SetColor(CYAN); std::cout << "[TCP] 尝试 " << host << ":" << port << " (RFC" << (rfc == StunRfc::RFC5780 ? "5780" : "3489") << ", 第 " << i + 1 << " 次)..." << std::endl;
+                    Print(CYAN, "[TCP] 尝试 ", host, ":", port, " (RFC", (rfc == StunRfc::RFC5780 ? "5780" : "3489"), ", 第 ", i + 1, " 次)...");
                     
                     listener_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                     stun_heartbeat_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -304,7 +310,7 @@ void TCP_PortForwardingThread(Config base_config) {
                     }
                     if (stun_success) return;
                     closesocket(listener_sock); closesocket(stun_heartbeat_sock);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 }
             };
 
@@ -314,9 +320,9 @@ void TCP_PortForwardingThread(Config base_config) {
         }
 
         if (!stun_success) {
-            SetColor(RED); std::cerr << "[TCP] 所有STUN服务器和协议均尝试失败。" << std::endl;
+            Print(RED, "[TCP] 所有STUN服务器和协议均尝试失败。");
             if (config.auto_retry) {
-                SetColor(YELLOW); std::cout << "[TCP] 等待 " << config.retry_interval_ms / 1000 << " 秒后重试..." << std::endl;
+                Print(YELLOW, "[TCP] 等待 ", config.retry_interval_ms / 1000, " 秒后重试...");
                 std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms));
             }
             continue;
@@ -324,14 +330,13 @@ void TCP_PortForwardingThread(Config base_config) {
 
         if (config.tcp_forward_port == 0) {
             config.tcp_forward_port = public_port;
-            SetColor(CYAN); std::cout << "[TCP] 动态转发端口已设置为: " << *config.tcp_forward_port << std::endl;
+            Print(CYAN, "[TCP] 动态转发端口已设置为: ", *config.tcp_forward_port);
         }
 
         tcp_keepalive ka; ka.onoff = (u_long)1; ka.keepalivetime = config.keep_alive_ms; ka.keepaliveinterval = 1000;
         DWORD bytes_returned;
         WSAIoctl(stun_heartbeat_sock, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), NULL, 0, &bytes_returned, NULL, NULL);
-        SetColor(LIGHT_GREEN);
-        std::cout << "[TCP] 成功！公网端口 " << public_ip << ":" << public_port << " 已开启并监听。" << std::endl;
+        Print(LIGHT_GREEN, "[TCP] 成功！公网端口 ", public_ip, ":", public_port, " 已开启并监听。");
         
         std::thread(TCP_StunCheckThread, stun_heartbeat_sock, public_ip, public_port, config).detach();
 
@@ -344,10 +349,10 @@ void TCP_PortForwardingThread(Config base_config) {
             if (activity > 0 && FD_ISSET(listener_sock, &read_fds)) {
                 SOCKET peer_sock = accept(listener_sock, NULL, NULL);
                 if (peer_sock != INVALID_SOCKET) {
-                    if (config.tcp_forward_host) {
+                    if (config.tcp_forward_host && !config.tcp_forward_host->empty()) {
                         std::thread(TCP_HandleNewConnection, peer_sock, config).detach();
                     } else {
-                        SetColor(CYAN); std::cout << "[TCP] 接受连接并立即关闭 (仅打洞模式)。" << std::endl;
+                        Print(CYAN, "[TCP] 接受连接并立即关闭 (仅打洞模式)。");
                         closesocket(peer_sock);
                     }
                 }
@@ -355,7 +360,7 @@ void TCP_PortForwardingThread(Config base_config) {
         }
         closesocket(listener_sock); closesocket(stun_heartbeat_sock);
         if (g_tcp_reconnect_flag) {
-            SetColor(YELLOW); std::cout << "[TCP] 检测到重连信号，重启流程..." << std::endl;
+            Print(YELLOW, "[TCP] 检测到重连信号，重启流程...");
         }
     } while (base_config.auto_retry);
 }
@@ -379,7 +384,7 @@ void UDP_PortForwardingThread(Config base_config) {
         bool stun_success = false;
         std::map<std::string, UDPSession> sessions;
 
-        SetColor(WHITE); std::cout << "\n--- [UDP] 开始新一轮端口开启尝试 ---" << std::endl;
+        Print(WHITE, "\n--- [UDP] 开始新一轮端口开启尝试 ---");
 
         for (const auto& server_str : config.stun_servers) {
             if (stun_success) break;
@@ -390,7 +395,7 @@ void UDP_PortForwardingThread(Config base_config) {
 
             auto attempt_stun = [&](StunRfc rfc) {
                 for (int i = 0; i < config.stun_retry; ++i) {
-                    SetColor(CYAN); std::cout << "[UDP] 尝试 " << host << ":" << port << " (RFC" << (rfc == StunRfc::RFC5780 ? "5780" : "3489") << ", 第 " << i + 1 << " 次)..." << std::endl;
+                    Print(CYAN, "[UDP] 尝试 ", host, ":", port, " (RFC", (rfc == StunRfc::RFC5780 ? "5780" : "3489"), ", 第 ", i + 1, " 次)...");
                     
                     public_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
                     if(public_sock == INVALID_SOCKET) continue;
@@ -408,7 +413,7 @@ void UDP_PortForwardingThread(Config base_config) {
                     }
                     if (stun_success) return;
                     closesocket(public_sock);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 }
             };
             attempt_stun(StunRfc::RFC5780);
@@ -417,21 +422,25 @@ void UDP_PortForwardingThread(Config base_config) {
         }
 
         if (!stun_success) {
-            SetColor(RED); std::cerr << "[UDP] 所有STUN服务器和协议均尝试失败。" << std::endl;
+            Print(RED, "[UDP] 所有STUN服务器和协议均尝试失败。");
             if (config.auto_retry) {
-                SetColor(YELLOW); std::cout << "[UDP] 等待 " << config.retry_interval_ms / 1000 << " 秒后重试..." << std::endl;
+                Print(YELLOW, "[UDP] 等待 ", config.retry_interval_ms / 1000, " 秒后重试...");
                 std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms));
             }
             continue;
         }
 
+        // *** FIX: Disconnect UDP socket to receive from any peer ***
+        sockaddr_in disconnect_addr = {};
+        disconnect_addr.sin_family = AF_UNSPEC;
+        connect(public_sock, (sockaddr*)&disconnect_addr, sizeof(disconnect_addr));
+
         if (config.udp_forward_port == 0) {
             config.udp_forward_port = public_port;
-            SetColor(CYAN); std::cout << "[UDP] 动态转发端口已设置为: " << *config.udp_forward_port << std::endl;
+            Print(CYAN, "[UDP] 动态转发端口已设置为: ", *config.udp_forward_port);
         }
 
-        SetColor(LIGHT_GREEN);
-        std::cout << "[UDP] 成功！公网端口 " << public_ip << ":" << public_port << " 已开启。" << std::endl;
+        Print(LIGHT_GREEN, "[UDP] 成功！公网端口 ", public_ip, ":", public_port, " 已开启。");
         
         auto last_cleanup_time = std::chrono::steady_clock::now();
 
@@ -463,8 +472,8 @@ void UDP_PortForwardingThread(Config base_config) {
                             sessions[session_key].last_activity = std::chrono::steady_clock::now();
                             send(sessions[session_key].local_socket, buffer.data(), bytes, 0);
                         } else {
-                            if (config.udp_forward_host) {
-                                SetColor(GREEN); std::cout << "[UDP] 来自 " << session_key << " 的新会话。" << std::endl;
+                            if (config.udp_forward_host && !config.udp_forward_host->empty()) {
+                                Print(GREEN, "[UDP] 来自 ", session_key, " 的新会话。");
                                 SOCKET local_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
                                 addrinfo* fwd_res = nullptr;
                                 getaddrinfo(config.udp_forward_host->c_str(), std::to_string(*config.udp_forward_port).c_str(), nullptr, &fwd_res);
@@ -476,7 +485,7 @@ void UDP_PortForwardingThread(Config base_config) {
                         }
                     }
                 }
-                for (auto it = sessions.begin(); it != sessions.end(); ) {
+                for (auto it = sessions.begin(); it != sessions.end(); ++it) {
                     if (FD_ISSET(it->second.local_socket, &read_fds)) {
                         std::vector<char> buffer(config.udp_max_chunk_length);
                         int bytes = recv(it->second.local_socket, buffer.data(), buffer.size(), 0);
@@ -485,7 +494,6 @@ void UDP_PortForwardingThread(Config base_config) {
                             sendto(public_sock, buffer.data(), bytes, 0, (sockaddr*)&it->second.peer_addr, sizeof(it->second.peer_addr));
                         }
                     }
-                    ++it;
                 }
             }
             
@@ -493,7 +501,7 @@ void UDP_PortForwardingThread(Config base_config) {
             if (std::chrono::duration_cast<std::chrono::seconds>(now - last_cleanup_time).count() >= 10) {
                 for (auto it = sessions.begin(); it != sessions.end(); ) {
                     if (std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.last_activity).count() > config.udp_session_timeout_ms) {
-                        SetColor(YELLOW); std::cout << "[UDP] 会话 " << it->first << " 超时，已清理。" << std::endl;
+                        Print(YELLOW, "[UDP] 会话 ", it->first, " 超时，已清理。");
                         closesocket(it->second.local_socket);
                         it = sessions.erase(it);
                     } else {
@@ -506,7 +514,7 @@ void UDP_PortForwardingThread(Config base_config) {
         closesocket(public_sock);
         for(const auto& pair : sessions) closesocket(pair.second.local_socket);
         if (g_udp_reconnect_flag) {
-            SetColor(YELLOW); std::cout << "[UDP] 检测到重连信号，重启流程..." << std::endl;
+            Print(YELLOW, "[UDP] 检测到重连信号，重启流程...");
         }
     } while (base_config.auto_retry);
 }
@@ -528,11 +536,10 @@ int main(int argc, char* argv[]) {
     
     Config config = ReadIniConfig(iniPath);
 
-    SetColor(YELLOW);
-    std::cout << "--- TCP/UDP NAT 端口转发器 (高级版) ---" << std::endl;
-    std::cout << "配置文件 " << iniPath << " 已加载。" << std::endl;
+    Print(YELLOW, "--- TCP/UDP NAT 端口转发器 (高级版) ---");
+    Print(YELLOW, "配置文件 ", iniPath, " 已加载。");
     if (config.stun_servers.empty()) {
-        SetColor(RED); std::cerr << "错误：配置文件中未找到任何 [STUN] 服务器。" << std::endl;
+        Print(RED, "错误：配置文件中未找到任何 [STUN] 服务器。");
         return 1;
     }
 
@@ -545,8 +552,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (threads.empty()) {
-        SetColor(RED);
-        std::cout << "错误：配置文件中未启用任何监听端口 (TCPListenPort 或 UDPListenPort)。" << std::endl;
+        Print(RED, "错误：配置文件中未启用任何监听端口 (TCPListenPort 或 UDPListenPort)。");
         return 1;
     }
 
