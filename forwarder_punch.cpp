@@ -51,17 +51,6 @@ std::string trim(const std::string& s) {
     return s.substr(first, (last - first + 1));
 }
 
-bool RecvAll(SOCKET sock, char* buffer, int len, int timeout_ms) {
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_ms, sizeof(timeout_ms));
-    int total_received = 0;
-    while (total_received < len) {
-        int bytes = recv(sock, buffer + total_received, len - total_received, 0);
-        if (bytes <= 0) return false;
-        total_received += bytes;
-    }
-    return true;
-}
-
 // =================================================================================
 // 配置管理
 // =================================================================================
@@ -217,14 +206,14 @@ void TCP_HandleNewConnection(SOCKET peer_sock, Config config) {
     freeaddrinfo(fwd_res);
 }
 
-void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config& config) {
+// *** FIX: Reworked TCP monitoring thread to use the same local port ***
+void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config& config, int local_port) {
     while (!g_tcp_reconnect_flag) {
         std::this_thread::sleep_for(std::chrono::minutes(5));
         if (g_tcp_reconnect_flag) break;
 
         Print(CYAN, "\n[TCP] 监控: 正在检查公网地址...");
         
-        // 使用第一个 STUN 服务器进行检查
         const auto& server_str = config.stun_servers[0];
         size_t colon_pos = server_str.find(':');
         if (colon_pos == std::string::npos) { g_tcp_reconnect_flag = true; break; }
@@ -234,13 +223,23 @@ void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
         SOCKET check_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (check_sock == INVALID_SOCKET) { g_tcp_reconnect_flag = true; break; }
 
+        BOOL reuse = TRUE;
+        setsockopt(check_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+        sockaddr_in local_addr = { AF_INET, htons(local_port), {INADDR_ANY} };
+
+        if (bind(check_sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR) {
+            closesocket(check_sock);
+            g_tcp_reconnect_flag = true;
+            break;
+        }
+
         addrinfo* stun_res = nullptr;
         bool check_success = false;
         std::string current_ip; int current_port;
 
         if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), nullptr, &stun_res) == 0) {
             if (connect(check_sock, stun_res->ai_addr, (int)stun_res->ai_addrlen) == 0) {
-                char req[20] = {0}; // Build RFC5780 request
+                char req[20] = {0};
                 *(unsigned short*)req = htons(0x0001); *(unsigned int*)(req + 4) = htonl(0x2112A442);
                 std::random_device rd; std::mt19937 gen(rd()); std::uniform_int_distribution<unsigned int> dis;
                 for (int i = 0; i < 3; ++i) *(unsigned int*)(req + 8 + i * 4) = dis(gen);
@@ -307,12 +306,11 @@ void TCP_PortForwardingThread(Config base_config) {
                     if (bind(listener_sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR ||
                         bind(stun_heartbeat_sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR ||
                         listen(listener_sock, SOMAXCONN) == SOCKET_ERROR) {
-                        // Bind or listen failed
                     } else {
                         addrinfo* stun_res = nullptr;
                         if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), nullptr, &stun_res) == 0) {
                             if (connect(stun_heartbeat_sock, stun_res->ai_addr, (int)stun_res->ai_addrlen) == 0) {
-                                char req[20] = {0}; // Build request
+                                char req[20] = {0};
                                 *(unsigned short*)req = htons(0x0001);
                                 if(rfc == StunRfc::RFC5780) *(unsigned int*)(req + 4) = htonl(0x2112A442);
                                 std::random_device rd; std::mt19937 gen(rd()); std::uniform_int_distribution<unsigned int> dis;
@@ -361,7 +359,7 @@ void TCP_PortForwardingThread(Config base_config) {
         WSAIoctl(stun_heartbeat_sock, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), NULL, 0, &bytes_returned, NULL, NULL);
         Print(LIGHT_GREEN, "[TCP] 成功！公网端口 ", public_ip, ":", public_port, " 已开启并监听。");
         
-        std::thread(TCP_StunCheckThread, public_ip, public_port, config).detach();
+        std::thread(TCP_StunCheckThread, public_ip, public_port, config, *config.tcp_listen_port).detach();
 
         while (!g_tcp_reconnect_flag) {
             fd_set read_fds; FD_ZERO(&read_fds); FD_SET(listener_sock, &read_fds);
@@ -513,6 +511,8 @@ void UDP_PortForwardingThread(Config base_config) {
                                 freeaddrinfo(fwd_res);
                                 send(local_sock, buffer.data(), bytes, 0);
                                 sessions[session_key] = { local_sock, peer_addr, std::chrono::steady_clock::now() };
+                            } else {
+                                Print(CYAN, "[UDP] 收到来自 ", session_key, " 的数据包 (仅打洞模式)，已丢弃。");
                             }
                         }
                     }
