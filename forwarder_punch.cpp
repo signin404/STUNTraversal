@@ -14,7 +14,8 @@
 #include <map>
 #include <mutex>
 #include <stdexcept>
-#include <fstream> // For custom INI parsing
+#include <fstream>
+#include <sstream>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -49,23 +50,21 @@ struct Settings {
     std::vector<std::string> stun_servers;
 };
 
-// --- 字符串 Trim 函数 ---
+// --- 新增:字符串 Trim 函数 ---
 std::string trim(const std::string& str) {
     const std::string whitespace = " \t\n\r\f\v";
     size_t first = str.find_first_not_of(whitespace);
-    if (std::string::npos == first) return "";
+    if (std::string::npos == first) {
+        return "";
+    }
     size_t last = str.find_last_not_of(whitespace);
     return str.substr(first, (last - first + 1));
 }
 
-// --- 自定义 INI 文件解析器 ---
-Settings ReadIniConfigCustom(const std::string& filePath) {
+// --- INI 文件解析 (修复版) ---
+Settings ReadIniConfig(const std::string& filePath) {
     Settings settings;
-    std::ifstream file(filePath);
-    if (!file.is_open()) {
-        throw std::runtime_error("无法打开配置文件: " + filePath);
-    }
-
+    
     auto safe_stoi = [&](const std::string& s, int default_val) {
         if (s.empty()) return default_val;
         try {
@@ -75,51 +74,89 @@ Settings ReadIniConfigCustom(const std::string& filePath) {
         }
     };
 
-    std::string current_section;
-    std::string line;
-    while (std::getline(file, line)) {
-        line = trim(line);
-        if (line.empty() || line[0] == ';') continue;
+    // 读取基本配置
+    char buffer[4096];
+    settings.tcp_listen_port = GetPrivateProfileIntA("Settings", "TCPListenPort", 0, filePath.c_str());
+    GetPrivateProfileStringA("Settings", "TCPForwardHost", "", buffer, sizeof(buffer), filePath.c_str());
+    settings.tcp_forward_host = trim(buffer);
+    
+    GetPrivateProfileStringA("Settings", "TCPForwardPort", "0", buffer, sizeof(buffer), filePath.c_str());
+    std::string tcp_fwd_port_str = trim(buffer);
+    std::transform(tcp_fwd_port_str.begin(), tcp_fwd_port_str.end(), tcp_fwd_port_str.begin(), ::tolower);
+    settings.tcp_forward_port = (tcp_fwd_port_str == "auto") ? -1 : safe_stoi(tcp_fwd_port_str, 0);
 
-        if (line[0] == '[' && line.back() == ']') {
-            current_section = trim(line.substr(1, line.length() - 2));
-            continue;
-        }
+    settings.udp_listen_port = GetPrivateProfileIntA("Settings", "UDPListenPort", 0, filePath.c_str());
+    GetPrivateProfileStringA("Settings", "UDPForwardHost", "", buffer, sizeof(buffer), filePath.c_str());
+    settings.udp_forward_host = trim(buffer);
+    
+    GetPrivateProfileStringA("Settings", "UDPForwardPort", "0", buffer, sizeof(buffer), filePath.c_str());
+    std::string udp_fwd_port_str = trim(buffer);
+    std::transform(udp_fwd_port_str.begin(), udp_fwd_port_str.end(), udp_fwd_port_str.begin(), ::tolower);
+    settings.udp_forward_port = (udp_fwd_port_str == "auto") ? -1 : safe_stoi(udp_fwd_port_str, 0);
+    
+    settings.udp_session_timeout_ms = GetPrivateProfileIntA("Settings", "UDPSessionTimeoutMS", 30000, filePath.c_str());
+    settings.udp_max_chunk_length = GetPrivateProfileIntA("Settings", "UDPMaxChunkLength", 1500, filePath.c_str());
+    settings.punch_timeout_ms = GetPrivateProfileIntA("Settings", "PunchTimeoutMS", 3000, filePath.c_str());
+    settings.keep_alive_ms = GetPrivateProfileIntA("Settings", "KeepAliveMS", 2300, filePath.c_str());
+    settings.retry_interval_ms = GetPrivateProfileIntA("Settings", "RetryIntervalMS", 3000, filePath.c_str());
+    settings.auto_retry = GetPrivateProfileIntA("Settings", "AutoRetry", 1, filePath.c_str()) == 1;
+    settings.stun_retry = GetPrivateProfileIntA("Settings", "STUNRetry", 3, filePath.c_str());
 
-        if (current_section == "Settings") {
-            size_t equals_pos = line.find('=');
-            if (equals_pos != std::string::npos) {
-                std::string key = trim(line.substr(0, equals_pos));
-                std::string value = trim(line.substr(equals_pos + 1));
-                
-                if (key == "TCPListenPort") settings.tcp_listen_port = safe_stoi(value, 0);
-                else if (key == "TCPForwardHost") settings.tcp_forward_host = value;
-                else if (key == "TCPForwardPort") {
-                    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                    settings.tcp_forward_port = (value == "auto") ? -1 : safe_stoi(value, 0);
-                }
-                else if (key == "UDPListenPort") settings.udp_listen_port = safe_stoi(value, 0);
-                else if (key == "UDPForwardHost") settings.udp_forward_host = value;
-                else if (key == "UDPForwardPort") {
-                    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                    settings.udp_forward_port = (value == "auto") ? -1 : safe_stoi(value, 0);
-                }
-                else if (key == "UDPSessionTimeoutMS") settings.udp_session_timeout_ms = safe_stoi(value, 30000);
-                else if (key == "UDPMaxChunkLength") settings.udp_max_chunk_length = safe_stoi(value, 1500);
-                else if (key == "PunchTimeoutMS") settings.punch_timeout_ms = safe_stoi(value, 3000);
-                else if (key == "KeepAliveMS") settings.keep_alive_ms = safe_stoi(value, 2300);
-                else if (key == "RetryIntervalMS") settings.retry_interval_ms = safe_stoi(value, 3000);
-                else if (key == "AutoRetry") settings.auto_retry = (safe_stoi(value, 1) == 1);
-                else if (key == "STUNRetry") settings.stun_retry = safe_stoi(value, 3);
+    // 读取 STUN 服务器列表 - 修复版
+    // 直接读取文件内容解析 [STUN] 部分
+    std::ifstream file(filePath);
+    if (file.is_open()) {
+        std::string line;
+        bool in_stun_section = false;
+        
+        while (std::getline(file, line)) {
+            line = trim(line);
+            
+            // 检查是否进入 [STUN] 部分
+            if (line == "[STUN]") {
+                in_stun_section = true;
+                continue;
             }
-        } else if (current_section == "STUN") {
-            settings.stun_servers.push_back(line);
+            
+            // 检查是否进入其他部分
+            if (!line.empty() && line[0] == '[') {
+                in_stun_section = false;
+                continue;
+            }
+            
+            // 如果在 STUN 部分,解析服务器地址
+            if (in_stun_section && !line.empty() && line[0] != ';' && line[0] != '#') {
+                // 移除注释部分
+                size_t comment_pos = line.find(';');
+                if (comment_pos != std::string::npos) {
+                    line = line.substr(0, comment_pos);
+                }
+                comment_pos = line.find('#');
+                if (comment_pos != std::string::npos) {
+                    line = line.substr(0, comment_pos);
+                }
+                
+                line = trim(line);
+                
+                // 如果有等号,取等号后的值(支持 key=value 格式)
+                size_t equals_pos = line.find('=');
+                if (equals_pos != std::string::npos) {
+                    line = trim(line.substr(equals_pos + 1));
+                }
+                
+                // 验证格式是否为 host:port
+                if (!line.empty() && line.find(':') != std::string::npos) {
+                    settings.stun_servers.push_back(line);
+                }
+            }
         }
+        file.close();
     }
+
     return settings;
 }
 
-// --- 辅助函数：RecvAll ---
+// --- 辅助函数:RecvAll ---
 bool RecvAll(SOCKET sock, char* buffer, int len) {
     int total_received = 0;
     while (total_received < len) {
@@ -168,7 +205,11 @@ bool GetPublicEndpoint(const std::string& server_str, bool is_tcp, bool use_rfc5
     char req[20] = { 0 };
     *(unsigned short*)req = htons(0x0001);
     *(unsigned short*)(req + 2) = 0;
-    std::random_device rd; unsigned int seed = rd(); std::mt19937 gen(seed); std::uniform_int_distribution<unsigned int> dis;
+    
+    std::random_device rd;
+    unsigned int seed = rd();
+    std::mt19937 gen(seed);
+    std::uniform_int_distribution<unsigned int> dis;
 
     if (use_rfc5780) {
         *(unsigned int*)(req + 4) = htonl(0x2112A442);
@@ -353,13 +394,13 @@ void TCPPunchingThread(Settings settings) {
             {
                 std::lock_guard<std::mutex> lock(g_console_mutex);
                 SetColor(LIGHT_GREEN);
-                std::cout << "[TCP] 打洞成功！公网端口 " << public_ip << ":" << public_port << " 已开启并监听。" << std::endl;
+                std::cout << "[TCP] 打洞成功!公网端口 " << public_ip << ":" << public_port << " 已开启并监听。" << std::endl;
                 if (!settings.tcp_forward_host.empty()) {
                     SetColor(YELLOW);
                     std::cout << "[TCP] 传入连接将被转发到 " << settings.tcp_forward_host << ":" << final_forward_port << std::endl;
                 } else {
                     SetColor(YELLOW);
-                    std::cout << "[TCP] 仅打洞模式：端口已开启，请在路由器/防火墙上手动配置转发。" << std::endl;
+                    std::cout << "[TCP] 仅打洞模式:端口已开启,请在路由器/防火墙上手动配置转发。" << std::endl;
                 }
             }
 
@@ -435,13 +476,13 @@ void UDPPunchingThread(Settings settings) {
             {
                 std::lock_guard<std::mutex> lock(g_console_mutex);
                 SetColor(LIGHT_GREEN);
-                std::cout << "[UDP] 打洞成功！公网端口 " << public_ip << ":" << public_port << " 已开启。" << std::endl;
+                std::cout << "[UDP] 打洞成功!公网端口 " << public_ip << ":" << public_port << " 已开启。" << std::endl;
                 if (!settings.udp_forward_host.empty()) {
                     SetColor(YELLOW);
                     std::cout << "[UDP] 传入数据包将被转发到 " << settings.udp_forward_host << ":" << final_forward_port << std::endl;
                 } else {
                     SetColor(YELLOW);
-                    std::cout << "[UDP] 仅打洞模式：端口已开启，请在路由器/防火墙上手动配置转发。" << std::endl;
+                    std::cout << "[UDP] 仅打洞模式:端口已开启,请在路由器/防火墙上手动配置转发。" << std::endl;
                 }
             }
 
@@ -502,88 +543,4 @@ void UDPPunchingThread(Settings settings) {
         } while (settings.auto_retry);
     } catch (const std::exception& e) {
         std::lock_guard<std::mutex> lock(g_console_mutex);
-        SetColor(RED);
-        std::cerr << "[UDP] 线程发生严重异常: " << e.what() << std::endl;
-    } catch (...) {
-        std::lock_guard<std::mutex> lock(g_console_mutex);
-        SetColor(RED);
-        std::cerr << "[UDP] 线程发生未知严重异常。" << std::endl;
-    }
-}
-
-// --- 主函数 ---
-int main(int argc, char* argv[]) {
-    SetConsoleOutputCP(65001);
-    SetConsoleTitleA("TCP/UDP NAT 端口转发器");
-    WSADATA wsaData;
-    WSAStartup(MAKEWORD(2, 2), &wsaData);
-
-    {
-        std::lock_guard<std::mutex> lock(g_console_mutex);
-        std::cout << "正在初始化..." << std::endl;
-    }
-
-    Settings settings;
-    try {
-        char exePath[MAX_PATH];
-        GetModuleFileNameA(NULL, exePath, MAX_PATH);
-        PathRemoveFileSpecA(exePath);
-        std::string iniPath = std::string(exePath) + "\\config.ini";
-        settings = ReadIniConfigCustom(iniPath);
-    } catch (const std::exception& e) {
-        std::lock_guard<std::mutex> lock(g_console_mutex);
-        SetColor(RED);
-        std::cerr << "[致命错误] 读取或解析配置文件时发生异常: " << e.what() << std::endl;
-        system("pause");
-        return 1;
-    } catch (...) {
-        std::lock_guard<std::mutex> lock(g_console_mutex);
-        SetColor(RED);
-        std::cerr << "[致命错误] 读取或解析配置文件时发生未知异常。" << std::endl;
-        system("pause");
-        return 1;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(g_console_mutex);
-        SetColor(YELLOW);
-        std::cout << "--- TCP/UDP NAT 端口转发器 (高级健壮版) ---" << std::endl;
-    }
-
-    if (settings.stun_servers.empty()) {
-        std::lock_guard<std::mutex> lock(g_console_mutex);
-        SetColor(RED);
-        std::cerr << "[错误] 配置文件中 [STUN] 服务器列表为空！程序无法运行。" << std::endl;
-        system("pause");
-        return 1;
-    }
-
-    if (settings.tcp_listen_port > 0) {
-        {
-            std::lock_guard<std::mutex> lock(g_console_mutex);
-            std::cout << "[信息] TCP 穿透功能已启用。" << std::endl;
-        }
-        std::thread(TCPPunchingThread, settings).detach();
-    } else {
-        std::lock_guard<std::mutex> lock(g_console_mutex);
-        std::cout << "[信息] TCP 穿透功能已禁用。" << std::endl;
-    }
-
-    if (settings.udp_listen_port > 0) {
-        {
-            std::lock_guard<std::mutex> lock(g_console_mutex);
-            std::cout << "[信息] UDP 穿透功能已启用。" << std::endl;
-        }
-        std::thread(UDPPunchingThread, settings).detach();
-    } else {
-        std::lock_guard<std::mutex> lock(g_console_mutex);
-        std::cout << "[信息] UDP 穿透功能已禁用。" << std::endl;
-    }
-
-    while (true) {
-        std::this_thread::sleep_for(std::chrono::hours(1));
-    }
-
-    WSACleanup();
-    return 0;
-}
+        SetColor(RED
