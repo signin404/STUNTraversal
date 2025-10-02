@@ -265,8 +265,9 @@ bool ParseStunResponse(char* response_buffer, int response_len, StunRfc rfc, std
 // 外部程序调用和系统通知
 // =================================================================================
 
+// 【推荐】使用这个完全异步的版本替换旧的 ShowToastNotification 函数
 void ShowToastNotification(const std::wstring& aumid, const std::wstring& message, const std::wstring& title_override = L"") {
-    if (!g_is_hidden && title_override.empty()) return; // 自动通知仅在隐藏时显示
+    if (!g_is_hidden && title_override.empty()) return;
 
     HKEY hKey;
     std::wstring regPath = L"Software\\Classes\\AppUserModelId\\" + aumid;
@@ -288,20 +289,24 @@ void ShowToastNotification(const std::wstring& aumid, const std::wstring& messag
         toastXml.LoadXml(xml_content);
         winrt::Windows::UI::Notifications::ToastNotification notification(toastXml);
 
-        std::promise<void> promise;
-        auto future = promise.get_future();
+        // 将 aumid 按值捕获，以便在回调中使用
+        auto cleanup_callback = [aumid_copy = aumid](const auto&, const auto&) {
+            std::wstring regPath_copy = L"Software\\Classes\\AppUserModelId\\" + aumid_copy;
+            RegDeleteKeyW(HKEY_CURRENT_USER, regPath_copy.c_str());
+        };
 
-        notification.Dismissed([&](const auto&, const auto&) { try { promise.set_value(); } catch (...) {} });
-        notification.Failed([&](const auto&, const auto&) { try { promise.set_value(); } catch (...) {} });
+        // 注册回调，当通知关闭或失败时，自动删除注册表项
+        notification.Dismissed(cleanup_callback);
+        notification.Failed(cleanup_callback);
 
+        // 发射通知，然后立即返回，不阻塞
         notifier.Show(notification);
-        future.wait();
 
     } catch (const winrt::hresult_error& e) {
         std::wcerr << L"Toast notification error: " << e.message().c_str() << std::endl;
+        // 如果创建失败，也尝试清理注册表
+        RegDeleteKeyW(HKEY_CURRENT_USER, regPath.c_str());
     }
-
-    RegDeleteKeyW(HKEY_CURRENT_USER, regPath.c_str());
 }
 
 bool IsProcessRunning(const std::wstring& processName) {
@@ -390,6 +395,7 @@ bool CheckAndExecuteRun(const Config& config, bool tcp_enabled, bool udp_enabled
 }
 
 // 【新】手动触发通知的函数
+// 【推荐】修复 TriggerManualNotification，为新线程初始化 COM
 void TriggerManualNotification() {
     Print(CYAN, "[IPC] 收到 -show 命令，正在发送通知...");
     std::wstring msg;
@@ -404,9 +410,12 @@ void TriggerManualNotification() {
             msg += L"\nUDP: " + StringToWstring(g_udp_port_str);
         }
     }
-    // 使用新线程来显示通知，避免阻塞消息循环
+    
     std::thread([](const std::wstring& aumid, const std::wstring& message){
+        // 在新线程中使用 COM/WinRT 必须初始化
+        winrt::init_apartment(); 
         ShowToastNotification(aumid, message, aumid + L": Current Public Endpoint");
+        winrt::uninit_apartment();
     }, g_app_name, msg).detach();
 }
 
