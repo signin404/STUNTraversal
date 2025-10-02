@@ -14,6 +14,7 @@
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <functional> // <--- FIX: 为 std::ref 包含此头文件
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -97,15 +98,10 @@ Settings ReadIniConfig(const std::string& filePath) {
     settings.auto_retry = GetPrivateProfileIntA("Settings", "AutoRetry", 1, filePath.c_str()) == 1;
     settings.stun_retry = GetPrivateProfileIntA("Settings", "STUNRetry", 3, filePath.c_str());
 
-    // *** FIX: 更健壮的 STUN 服务器列表解析 ***
     GetPrivateProfileSectionA("STUN", buffer, sizeof(buffer), filePath.c_str());
     for (const char* p = buffer; *p; p += strlen(p) + 1) {
         std::string line = trim(p);
-        // 忽略注释和空行
-        if (line.empty() || line[0] == ';') {
-            continue;
-        }
-        // 处理 key=value 格式，只取 key
+        if (line.empty() || line[0] == ';') continue;
         size_t equals_pos = line.find('=');
         if (equals_pos != std::string::npos) {
             line = trim(line.substr(0, equals_pos));
@@ -128,7 +124,7 @@ bool RecvAll(SOCKET sock, char* buffer, int len) {
     return true;
 }
 
-// --- 通用 STUN 客户端 (已修复随机数逻辑) ---
+// --- 通用 STUN 客户端 ---
 bool GetPublicEndpoint(const std::string& server_str, bool is_tcp, bool use_rfc5780, int local_port,
                        std::string& out_ip, int& out_port, SOCKET& out_sock, int timeout_ms) {
     size_t colon_pos = server_str.find(':');
@@ -205,7 +201,7 @@ bool GetPublicEndpoint(const std::string& server_str, bool is_tcp, bool use_rfc5
         unsigned short len = ntohs(*(unsigned short*)(p + 2));
         const char* attr_value = p + 4;
 
-        if (p + 4 + len > end) break; // *** FIX: 增加边界检查防止缓冲区溢出 ***
+        if (p + 4 + len > end) break;
 
         if (use_rfc5780 && type == 0x0020) { // XOR_MAPPED_ADDRESS
             unsigned short port_net = *(unsigned short*)(attr_value + 2);
@@ -254,7 +250,7 @@ void TcpProxy(SOCKET s1, SOCKET s2, int keep_alive_ms) {
 }
 
 // --- TCP 连接处理 ---
-void HandleNewConnection(SOCKET peer_sock, Settings settings, int forward_port) {
+void HandleNewConnection(SOCKET peer_sock, const Settings& settings, int forward_port) {
     try {
         sockaddr_in peer_addr; int peer_addr_len = sizeof(peer_addr);
         getpeername(peer_sock, (sockaddr*)&peer_addr, &peer_addr_len);
@@ -305,7 +301,7 @@ void HandleNewConnection(SOCKET peer_sock, Settings settings, int forward_port) 
 }
 
 // --- TCP 打洞线程 ---
-void TCPPunchingThread(Settings settings) {
+void TCPPunchingThread(const Settings& settings) { // <--- FIX: 接受 const 引用而非值
     try {
         do {
             g_tcp_reconnect_flag = false;
@@ -385,12 +381,12 @@ void TCPPunchingThread(Settings settings) {
 
             while (!g_tcp_reconnect_flag) {
                 fd_set read_fds; FD_ZERO(&read_fds); FD_SET(listener_sock, &read_fds);
-                timeval timeout; timeout.tv_sec = 1; timeout.tv_usec = 0; // *** FIX: 缩短 select 超时以便更快地响应 reconnect 标志 ***
+                timeval timeout; timeout.tv_sec = 1; timeout.tv_usec = 0;
                 int activity = select(0, &read_fds, NULL, NULL, &timeout);
                 if (activity > 0 && FD_ISSET(listener_sock, &read_fds)) {
                     SOCKET peer_sock = accept(listener_sock, NULL, NULL);
                     if (peer_sock != INVALID_SOCKET) {
-                        std::thread(HandleNewConnection, peer_sock, settings, final_forward_port).detach();
+                        std::thread(HandleNewConnection, peer_sock, std::ref(settings), final_forward_port).detach();
                     }
                 }
             }
@@ -409,7 +405,7 @@ void TCPPunchingThread(Settings settings) {
 }
 
 // --- UDP 打洞线程 ---
-void UDPPunchingThread(Settings settings) {
+void UDPPunchingThread(const Settings& settings) { // <--- FIX: 接受 const 引用而非值
     try {
         do {
             SOCKET punch_sock = INVALID_SOCKET;
@@ -465,10 +461,7 @@ void UDPPunchingThread(Settings settings) {
                 }
             }
 
-            // *** FIX: 移除在“仅打洞”模式下有问题的 keep-alive 循环 ***
             if (settings.udp_forward_host.empty()) {
-                // 在仅打洞模式下，我们不需要做任何事，只需保持 socket 打开。
-                // 主线程的 sleep 会让程序保持运行。
                 while(true) {
                     std::this_thread::sleep_for(std::chrono::seconds(60));
                 }
@@ -489,7 +482,6 @@ void UDPPunchingThread(Settings settings) {
                 closesocket(punch_sock); closesocket(forward_sock);
                 if (settings.auto_retry) { std::this_thread::sleep_for(std::chrono::milliseconds(settings.retry_interval_ms)); continue; } else break;
             }
-
 
             struct Session { sockaddr_in public_addr; std::chrono::steady_clock::time_point last_seen; };
             std::map<std::string, Session> sessions;
@@ -516,7 +508,6 @@ void UDPPunchingThread(Settings settings) {
                     if (FD_ISSET(forward_sock, &read_fds)) {
                         int bytes = recvfrom(forward_sock, buffer, settings.udp_max_chunk_length, 0, NULL, NULL);
                         if (bytes > 0 && !sessions.empty()) {
-                            // 转发给最后一个通信的客户端
                             sendto(punch_sock, buffer, bytes, 0, (sockaddr*)&sessions.rbegin()->second.public_addr, sizeof(sockaddr_in));
                         }
                     }
@@ -543,7 +534,7 @@ void UDPPunchingThread(Settings settings) {
     }
 }
 
-// --- 主函数 (最终诊断版本) ---
+// --- 主函数 ---
 int main(int argc, char* argv[]) {
     SetConsoleOutputCP(65001);
     SetConsoleTitleA("TCP/UDP NAT 端口转发器");
@@ -580,8 +571,8 @@ int main(int argc, char* argv[]) {
     try {
         if (settings.tcp_listen_port > 0) {
             std::cout << "[信息] 准备启动 TCP 线程..." << std::endl;
-            // 使用 emplace_back 捕获可能的异常
-            threads.emplace_back(TCPPunchingThread, settings); 
+            // <--- FIX: 使用 std::ref 将 settings 作为引用传递，避免崩溃
+            threads.emplace_back(TCPPunchingThread, std::ref(settings)); 
             std::cout << "[信息] TCP 线程已创建。" << std::endl;
         } else {
             std::cout << "[信息] TCP 穿透功能已禁用。" << std::endl;
@@ -589,14 +580,13 @@ int main(int argc, char* argv[]) {
 
         if (settings.udp_listen_port > 0) {
             std::cout << "[信息] 准备启动 UDP 线程..." << std::endl;
-            // 使用 emplace_back 捕获可能的异常
-            threads.emplace_back(UDPPunchingThread, settings);
+            // <--- FIX: 使用 std::ref 将 settings 作为引用传递，避免崩溃
+            threads.emplace_back(UDPPunchingThread, std::ref(settings));
             std::cout << "[信息] UDP 线程已创建。" << std::endl;
         } else {
             std::cout << "[信息] UDP 穿透功能已禁用。" << std::endl;
         }
     } catch (const std::exception& e) {
-        // 如果线程创建失败，会在这里被捕获
         SetColor(RED);
         std::cerr << "[致命错误] 创建线程时发生异常: " << e.what() << std::endl;
         system("pause");
@@ -609,7 +599,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << "[信息] 所有线程已启动，主线程进入等待状态。" << std::endl;
 
-    // 等待所有线程结束
+    // <--- FIX: 等待所有线程结束，确保程序持续运行且资源安全
     for (auto& t : threads) {
         if (t.joinable()) {
             t.join();
