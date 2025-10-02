@@ -546,7 +546,7 @@ void TCP_PortForwardingThread(Config base_config) {
 
             auto attempt_stun = [&](StunRfc rfc) {
                 for (int i = 0; i < config.stun_retry; ++i) {
-                    Print(CYAN, "[TCP] 尝试 ", host, ":", port, " (RFC" (rfc == StunRfc::RFC5780 ? "5780" : "3489"), ", 第 ", i + 1, " 次)...");
+                    Print(CYAN, "[TCP] 尝试 ", host, ":", port, " (RFC", (rfc == StunRfc::RFC5780 ? "5780" : "3489"), " 第 ", i + 1, " 次)...");
                     
                     listener_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                     stun_heartbeat_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -692,7 +692,7 @@ void UDP_PortForwardingThread(Config base_config) {
 
             auto attempt_stun = [&](StunRfc rfc) {
                 for (int i = 0; i < config.stun_retry; ++i) {
-                    Print(CYAN, "[UDP] 尝试 ", host, ":", port, " (RFC" (rfc == StunRfc::RFC5780 ? "5780" : "3489"), ", 第 ", i + 1, " 次)...");
+                    Print(CYAN, "[UDP] 尝试 ", host, ":", port, " (RFC", (rfc == StunRfc::RFC5780 ? "5780" : "3489"), " 第 ", i + 1, " 次)...");
                     
                     addrinfo* stun_res = nullptr;
                     if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), nullptr, &stun_res) == 0) {
