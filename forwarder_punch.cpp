@@ -14,6 +14,7 @@
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <fstream> // For custom INI parsing
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -48,21 +49,22 @@ struct Settings {
     std::vector<std::string> stun_servers;
 };
 
-// --- 新增：字符串 Trim 函数 ---
+// --- 字符串 Trim 函数 ---
 std::string trim(const std::string& str) {
     const std::string whitespace = " \t\n\r\f\v";
     size_t first = str.find_first_not_of(whitespace);
-    if (std::string::npos == first) {
-        return "";
-    }
+    if (std::string::npos == first) return "";
     size_t last = str.find_last_not_of(whitespace);
     return str.substr(first, (last - first + 1));
 }
 
-// --- INI 文件解析 (健壮版) ---
-Settings ReadIniConfig(const std::string& filePath) {
+// --- 自定义 INI 文件解析器 ---
+Settings ReadIniConfigCustom(const std::string& filePath) {
     Settings settings;
-    char buffer[4096];
+    std::ifstream file(filePath);
+    if (!file.is_open()) {
+        throw std::runtime_error("无法打开配置文件: " + filePath);
+    }
 
     auto safe_stoi = [&](const std::string& s, int default_val) {
         if (s.empty()) return default_val;
@@ -73,39 +75,46 @@ Settings ReadIniConfig(const std::string& filePath) {
         }
     };
 
-    settings.tcp_listen_port = GetPrivateProfileIntA("Settings", "TCPListenPort", 0, filePath.c_str());
-    GetPrivateProfileStringA("Settings", "TCPForwardHost", "", buffer, sizeof(buffer), filePath.c_str());
-    settings.tcp_forward_host = trim(buffer);
-    GetPrivateProfileStringA("Settings", "TCPForwardPort", "0", buffer, sizeof(buffer), filePath.c_str());
-    std::string tcp_fwd_port_str = trim(buffer); // *** FIX: Trim the string first ***
-    std::transform(tcp_fwd_port_str.begin(), tcp_fwd_port_str.end(), tcp_fwd_port_str.begin(), ::tolower);
-    settings.tcp_forward_port = (tcp_fwd_port_str == "auto") ? -1 : safe_stoi(tcp_fwd_port_str, 0);
+    std::string current_section;
+    std::string line;
+    while (std::getline(file, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == ';') continue;
 
-    settings.udp_listen_port = GetPrivateProfileIntA("Settings", "UDPListenPort", 0, filePath.c_str());
-    GetPrivateProfileStringA("Settings", "UDPForwardHost", "", buffer, sizeof(buffer), filePath.c_str());
-    settings.udp_forward_host = trim(buffer);
-    GetPrivateProfileStringA("Settings", "UDPForwardPort", "0", buffer, sizeof(buffer), filePath.c_str());
-    std::string udp_fwd_port_str = trim(buffer); // *** FIX: Trim the string first ***
-    std::transform(udp_fwd_port_str.begin(), udp_fwd_port_str.end(), udp_fwd_port_str.begin(), ::tolower);
-    settings.udp_forward_port = (udp_fwd_port_str == "auto") ? -1 : safe_stoi(udp_fwd_port_str, 0);
-    
-    settings.udp_session_timeout_ms = GetPrivateProfileIntA("Settings", "UDPSessionTimeoutMS", 30000, filePath.c_str());
-    settings.udp_max_chunk_length = GetPrivateProfileIntA("Settings", "UDPMaxChunkLength", 1500, filePath.c_str());
-    settings.punch_timeout_ms = GetPrivateProfileIntA("Settings", "PunchTimeoutMS", 3000, filePath.c_str());
-    settings.keep_alive_ms = GetPrivateProfileIntA("Settings", "KeepAliveMS", 2300, filePath.c_str());
-    settings.retry_interval_ms = GetPrivateProfileIntA("Settings", "RetryIntervalMS", 3000, filePath.c_str());
-    settings.auto_retry = GetPrivateProfileIntA("Settings", "AutoRetry", 1, filePath.c_str()) == 1;
-    settings.stun_retry = GetPrivateProfileIntA("Settings", "STUNRetry", 3, filePath.c_str());
-
-    GetPrivateProfileSectionA("STUN", buffer, sizeof(buffer), filePath.c_str());
-    for (const char* p = buffer; *p; ++p) {
-        std::string server = trim(p);
-        size_t equals_pos = server.find('=');
-        if (equals_pos != std::string::npos) server = trim(server.substr(0, equals_pos));
-        if (!server.empty() && server[0] != ';') {
-            settings.stun_servers.push_back(server);
+        if (line[0] == '[' && line.back() == ']') {
+            current_section = trim(line.substr(1, line.length() - 2));
+            continue;
         }
-        p += strlen(p);
+
+        if (current_section == "Settings") {
+            size_t equals_pos = line.find('=');
+            if (equals_pos != std::string::npos) {
+                std::string key = trim(line.substr(0, equals_pos));
+                std::string value = trim(line.substr(equals_pos + 1));
+                
+                if (key == "TCPListenPort") settings.tcp_listen_port = safe_stoi(value, 0);
+                else if (key == "TCPForwardHost") settings.tcp_forward_host = value;
+                else if (key == "TCPForwardPort") {
+                    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+                    settings.tcp_forward_port = (value == "auto") ? -1 : safe_stoi(value, 0);
+                }
+                else if (key == "UDPListenPort") settings.udp_listen_port = safe_stoi(value, 0);
+                else if (key == "UDPForwardHost") settings.udp_forward_host = value;
+                else if (key == "UDPForwardPort") {
+                    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+                    settings.udp_forward_port = (value == "auto") ? -1 : safe_stoi(value, 0);
+                }
+                else if (key == "UDPSessionTimeoutMS") settings.udp_session_timeout_ms = safe_stoi(value, 30000);
+                else if (key == "UDPMaxChunkLength") settings.udp_max_chunk_length = safe_stoi(value, 1500);
+                else if (key == "PunchTimeoutMS") settings.punch_timeout_ms = safe_stoi(value, 3000);
+                else if (key == "KeepAliveMS") settings.keep_alive_ms = safe_stoi(value, 2300);
+                else if (key == "RetryIntervalMS") settings.retry_interval_ms = safe_stoi(value, 3000);
+                else if (key == "AutoRetry") settings.auto_retry = (safe_stoi(value, 1) == 1);
+                else if (key == "STUNRetry") settings.stun_retry = safe_stoi(value, 3);
+            }
+        } else if (current_section == "STUN") {
+            settings.stun_servers.push_back(line);
+        }
     }
     return settings;
 }
@@ -121,7 +130,7 @@ bool RecvAll(SOCKET sock, char* buffer, int len) {
     return true;
 }
 
-// --- 通用 STUN 客户端 (已修复随机数逻辑) ---
+// --- 通用 STUN 客户端 ---
 bool GetPublicEndpoint(const std::string& server_str, bool is_tcp, bool use_rfc5780, int local_port,
                        std::string& out_ip, int& out_port, SOCKET& out_sock, int timeout_ms) {
     size_t colon_pos = server_str.find(':');
@@ -159,12 +168,7 @@ bool GetPublicEndpoint(const std::string& server_str, bool is_tcp, bool use_rfc5
     char req[20] = { 0 };
     *(unsigned short*)req = htons(0x0001);
     *(unsigned short*)(req + 2) = 0;
-    
-    // *** FIX: Correctly seed the random number engine ***
-    std::random_device rd;
-    unsigned int seed = rd();
-    std::mt19937 gen(seed);
-    std::uniform_int_distribution<unsigned int> dis;
+    std::random_device rd; unsigned int seed = rd(); std::mt19937 gen(seed); std::uniform_int_distribution<unsigned int> dis;
 
     if (use_rfc5780) {
         *(unsigned int*)(req + 4) = htonl(0x2112A442);
@@ -525,7 +529,7 @@ int main(int argc, char* argv[]) {
         GetModuleFileNameA(NULL, exePath, MAX_PATH);
         PathRemoveFileSpecA(exePath);
         std::string iniPath = std::string(exePath) + "\\config.ini";
-        settings = ReadIniConfig(iniPath);
+        settings = ReadIniConfigCustom(iniPath);
     } catch (const std::exception& e) {
         std::lock_guard<std::mutex> lock(g_console_mutex);
         SetColor(RED);
