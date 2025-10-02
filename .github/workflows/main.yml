@@ -21,7 +21,7 @@ jobs:
 
     - name: Compile C++ code
       # 修正编译命令
-      run: cl.exe forwarder_punch.cpp /std:c++17 /EHsc /O2 /MT /utf-8 /Fe:udp_forwarder.exe /link Ws2_32.lib Shlwapi.lib
+      run: cl.exe forwarder_punch.cpp /std:c++17 /EHsc /O2 /MD /Fe:udp_forwarder.exe /link Ws2_32.lib Shlwapi.lib
 
     - name: Prepare artifact for upload
       run: |
