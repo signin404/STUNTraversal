@@ -12,6 +12,7 @@
 #include <propsys.h>    // For IPropertyStore and PKEYs
 #include <propkey.h>    // For PKEY_AppUserModel_ID
 #include <string>
+#include <propvarutil.h>
 
 // C++/WinRT headers for Toast Notifications
 #include <winrt/Windows.UI.Notifications.h>
