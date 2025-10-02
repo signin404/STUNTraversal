@@ -146,9 +146,10 @@ void PortForwardingThread(Config config) {
         char req[20] = { 0 };
         *(unsigned short*)req = htons(0x0001); *(unsigned short*)(req + 2) = 0; *(unsigned int*)(req + 4) = htonl(0x2112A442);
         
-        // *** FIX: Corrected Most Vexing Parse and split into multiple lines ***
+        // *** FIX: Correctly seed the random number engine ***
         std::random_device rd;
-        std::mt19937 gen(rd); // Correct: pass the object 'rd', not the function call 'rd()'
+        unsigned int seed = rd(); // 1. Get a random number from the hardware device
+        std::mt19937 gen(seed);   // 2. Seed the Mersenne Twister engine with that number
         std::uniform_int_distribution<unsigned int> dis;
         
         for (int i = 0; i < 3; ++i) { *(unsigned int*)(req + 8 + i * 4) = dis(gen); }
