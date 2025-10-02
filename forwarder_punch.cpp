@@ -14,7 +14,7 @@
 #include <map>
 #include <mutex>
 #include <stdexcept>
-#include <functional> // <--- FIX: 为 std::ref 包含此头文件
+#include <functional> // 为 std::ref 包含此头文件
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -301,7 +301,15 @@ void HandleNewConnection(SOCKET peer_sock, const Settings& settings, int forward
 }
 
 // --- TCP 打洞线程 ---
-void TCPPunchingThread(const Settings& settings) { // <--- FIX: 接受 const 引用而非值
+void TCPPunchingThread(const Settings& settings) {
+    // --- 决定性诊断代码 ---
+    {
+        std::lock_guard<std::mutex> lock(g_console_mutex);
+        std::cout << "[TCP THREAD] 线程已进入，准备执行代码..." << std::endl;
+        std::cout.flush(); // 强制刷新，确保能看到输出
+    }
+    // --- 结束诊断代码 ---
+
     try {
         do {
             g_tcp_reconnect_flag = false;
@@ -405,7 +413,15 @@ void TCPPunchingThread(const Settings& settings) { // <--- FIX: 接受 const 引
 }
 
 // --- UDP 打洞线程 ---
-void UDPPunchingThread(const Settings& settings) { // <--- FIX: 接受 const 引用而非值
+void UDPPunchingThread(const Settings& settings) {
+    // --- 决定性诊断代码 ---
+    {
+        std::lock_guard<std::mutex> lock(g_console_mutex);
+        std::cout << "[UDP THREAD] 线程已进入，准备执行代码..." << std::endl;
+        std::cout.flush(); // 强制刷新，确保能看到输出
+    }
+    // --- 结束诊断代码 ---
+
     try {
         do {
             SOCKET punch_sock = INVALID_SOCKET;
@@ -571,7 +587,6 @@ int main(int argc, char* argv[]) {
     try {
         if (settings.tcp_listen_port > 0) {
             std::cout << "[信息] 准备启动 TCP 线程..." << std::endl;
-            // <--- FIX: 使用 std::ref 将 settings 作为引用传递，避免崩溃
             threads.emplace_back(TCPPunchingThread, std::ref(settings)); 
             std::cout << "[信息] TCP 线程已创建。" << std::endl;
         } else {
@@ -580,7 +595,6 @@ int main(int argc, char* argv[]) {
 
         if (settings.udp_listen_port > 0) {
             std::cout << "[信息] 准备启动 UDP 线程..." << std::endl;
-            // <--- FIX: 使用 std::ref 将 settings 作为引用传递，避免崩溃
             threads.emplace_back(UDPPunchingThread, std::ref(settings));
             std::cout << "[信息] UDP 线程已创建。" << std::endl;
         } else {
@@ -599,7 +613,6 @@ int main(int argc, char* argv[]) {
 
     std::cout << "[信息] 所有线程已启动，主线程进入等待状态。" << std::endl;
 
-    // <--- FIX: 等待所有线程结束，确保程序持续运行且资源安全
     for (auto& t : threads) {
         if (t.joinable()) {
             t.join();
