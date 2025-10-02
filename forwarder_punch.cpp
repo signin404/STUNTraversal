@@ -132,7 +132,7 @@ std::wstring GetStartMenuProgramsPath() {
     return L"";
 }
 
-// 【新函数】创建并注册快捷方式
+// 【新函数】创建并注册快捷方式 (已添加Shell通知)
 bool InstallShortcut(const wchar_t* shortcutName, const wchar_t* aumid) {
     std::wstring shortcutPath = GetStartMenuProgramsPath();
     if (shortcutPath.empty()) return false;
@@ -167,13 +167,28 @@ bool InstallShortcut(const wchar_t* shortcutName, const wchar_t* aumid) {
         }
         psl->Release();
     }
+
+    if (SUCCEEDED(hr)) {
+        // --- 决定性的一步 ---
+        // 强制通知 Shell，一个新的快捷方式已被创建。
+        // 这会触发Shell缓存的更新，让通知中心能够立即识别我们的AUMID。
+        SHChangeNotify(SHCNE_CREATE, SHCNF_PATH, shortcutPath.c_str(), NULL);
+        
+        // 添加一个微小的延迟，给Shell处理通知留出时间片
+        Sleep(100); 
+    }
+
     return SUCCEEDED(hr);
 }
 
-// 【新函数】清理快捷方式
+// 【新函数】清理快捷方式 (已添加Shell通知)
 void RemoveShortcut(const wchar_t* shortcutName) {
     std::wstring shortcutPath = GetStartMenuProgramsPath();
     if (shortcutPath.empty()) return;
     shortcutPath += L"\\" + std::wstring(shortcutName);
-    DeleteFileW(shortcutPath.c_str());
+    
+    if(DeleteFileW(shortcutPath.c_str())) {
+        // 通知 Shell，快捷方式已被删除
+        SHChangeNotify(SHCNE_DELETE, SHCNF_PATH, shortcutPath.c_str(), NULL);
+    }
 }
