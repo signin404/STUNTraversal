@@ -25,6 +25,9 @@
 #include <winrt/Windows.UI.Notifications.h>
 #include <winrt/Windows.Data.Xml.Dom.h>
 
+#include <winrt/Windows.Foundation.h> // 需要包含这个头文件
+#include <future> // 用于 std::promise
+
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "shell32.lib")
@@ -268,7 +271,7 @@ void ShowToastNotification(const std::wstring& aumid, const std::wstring& messag
     HKEY hKey;
     std::wstring regPath = L"Software\\Classes\\AppUserModelId\\" + aumid;
 
-    // 在显示通知前写入注册表
+    // 1. 写入注册表
     if (RegCreateKeyExW(HKEY_CURRENT_USER, regPath.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
         RegSetValueExW(hKey, L"DisplayName", 0, REG_SZ, (const BYTE*)aumid.c_str(), (aumid.length() + 1) * sizeof(wchar_t));
         RegCloseKey(hKey);
@@ -284,10 +287,32 @@ void ShowToastNotification(const std::wstring& aumid, const std::wstring& messag
 
         toastXml.LoadXml(xml_content);
         winrt::Windows::UI::Notifications::ToastNotification notification(toastXml);
-        notifier.Show(notification);
-    } catch (const winrt::hresult_error&) {}
 
-    // 显示通知后删除注册表项
+        // 使用 promise 来等待事件完成
+        std::promise<void> promise;
+        auto future = promise.get_future();
+
+        // 2. 为通知的 Dismissed 事件添加处理程序
+        notification.Dismissed([&](const auto&, const auto&) {
+            try { promise.set_value(); } catch (...) {}
+        });
+
+        // 3. 为通知的 Failed 事件添加处理程序
+        notification.Failed([&](const auto&, const auto&) {
+            try { promise.set_value(); } catch (...) {}
+        });
+
+        // 4. 显示通知
+        notifier.Show(notification);
+
+        // 5. 等待通知被关闭或失败
+        future.wait();
+
+    } catch (const winrt::hresult_error& e) {
+        std::wcerr << L"Toast notification error: " << e.message().c_str() << std::endl;
+    }
+
+    // 6. 在通知生命周期结束后，安全地删除注册表项
     RegDeleteKeyW(HKEY_CURRENT_USER, regPath.c_str());
 }
 
