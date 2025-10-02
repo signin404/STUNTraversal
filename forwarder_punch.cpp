@@ -11,6 +11,7 @@
 #include <sstream>
 #include <atomic>
 #include <mutex>
+#include <future> // 用于 std::promise
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -24,9 +25,7 @@
 // For Toast Notifications
 #include <winrt/Windows.UI.Notifications.h>
 #include <winrt/Windows.Data.Xml.Dom.h>
-
-#include <winrt/Windows.Foundation.h> // 需要包含这个头文件
-#include <future> // 用于 std::promise
+#include <winrt/Windows.Foundation.h>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -50,6 +49,7 @@ std::mutex g_run_mutex;
 
 HWND g_hMessageWindow = NULL;
 UINT const WM_APP_EXECUTE_RUN = WM_APP + 1;
+UINT const WM_APP_SHOW_NOTIFICATION = WM_APP + 2; // 【新】为 -show 命令添加的消息
 
 bool g_is_hidden = false;
 std::string g_public_ip, g_tcp_port_str, g_udp_port_str;
@@ -265,13 +265,12 @@ bool ParseStunResponse(char* response_buffer, int response_len, StunRfc rfc, std
 // 外部程序调用和系统通知
 // =================================================================================
 
-void ShowToastNotification(const std::wstring& aumid, const std::wstring& message) {
-    if (!g_is_hidden) return;
+void ShowToastNotification(const std::wstring& aumid, const std::wstring& message, const std::wstring& title_override = L"") {
+    if (!g_is_hidden && title_override.empty()) return; // 自动通知仅在隐藏时显示
 
     HKEY hKey;
     std::wstring regPath = L"Software\\Classes\\AppUserModelId\\" + aumid;
 
-    // 1. 写入注册表
     if (RegCreateKeyExW(HKEY_CURRENT_USER, regPath.c_str(), 0, NULL, REG_OPTION_NON_VOLATILE, KEY_WRITE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
         RegSetValueExW(hKey, L"DisplayName", 0, REG_SZ, (const BYTE*)aumid.c_str(), (aumid.length() + 1) * sizeof(wchar_t));
         RegCloseKey(hKey);
@@ -281,38 +280,27 @@ void ShowToastNotification(const std::wstring& aumid, const std::wstring& messag
         winrt::Windows::UI::Notifications::ToastNotifier notifier = winrt::Windows::UI::Notifications::ToastNotificationManager::CreateToastNotifier(aumid);
         winrt::Windows::Data::Xml::Dom::XmlDocument toastXml;
         
-        std::wstring xml_content = L"<toast><visual><binding template='ToastGeneric'><text>" + aumid + L": Public Endpoint Changed</text><text>";
+        std::wstring title = title_override.empty() ? (aumid + L": Public Endpoint Changed") : title_override;
+        std::wstring xml_content = L"<toast><visual><binding template='ToastGeneric'><text>" + title + L"</text><text>";
         xml_content += message;
         xml_content += L"</text></binding></visual></toast>";
 
         toastXml.LoadXml(xml_content);
         winrt::Windows::UI::Notifications::ToastNotification notification(toastXml);
 
-        // 使用 promise 来等待事件完成
         std::promise<void> promise;
         auto future = promise.get_future();
 
-        // 2. 为通知的 Dismissed 事件添加处理程序
-        notification.Dismissed([&](const auto&, const auto&) {
-            try { promise.set_value(); } catch (...) {}
-        });
+        notification.Dismissed([&](const auto&, const auto&) { try { promise.set_value(); } catch (...) {} });
+        notification.Failed([&](const auto&, const auto&) { try { promise.set_value(); } catch (...) {} });
 
-        // 3. 为通知的 Failed 事件添加处理程序
-        notification.Failed([&](const auto&, const auto&) {
-            try { promise.set_value(); } catch (...) {}
-        });
-
-        // 4. 显示通知
         notifier.Show(notification);
-
-        // 5. 等待通知被关闭或失败
         future.wait();
 
     } catch (const winrt::hresult_error& e) {
         std::wcerr << L"Toast notification error: " << e.message().c_str() << std::endl;
     }
 
-    // 6. 在通知生命周期结束后，安全地删除注册表项
     RegDeleteKeyW(HKEY_CURRENT_USER, regPath.c_str());
 }
 
@@ -400,6 +388,28 @@ bool CheckAndExecuteRun(const Config& config, bool tcp_enabled, bool udp_enabled
     }
     return false;
 }
+
+// 【新】手动触发通知的函数
+void TriggerManualNotification() {
+    Print(CYAN, "[IPC] 收到 -show 命令，正在发送通知...");
+    std::wstring msg;
+    if (g_public_ip.empty()) {
+        msg = L"Public IP not yet determined.";
+    } else {
+        msg = L"IP: " + StringToWstring(g_public_ip);
+        if (g_tcp_ready && !g_tcp_port_str.empty()) {
+            msg += L"\nTCP: " + StringToWstring(g_tcp_port_str);
+        }
+        if (g_udp_ready && !g_udp_port_str.empty()) {
+            msg += L"\nUDP: " + StringToWstring(g_udp_port_str);
+        }
+    }
+    // 使用新线程来显示通知，避免阻塞消息循环
+    std::thread([](const std::wstring& aumid, const std::wstring& message){
+        ShowToastNotification(aumid, message, aumid + L": Current Public Endpoint");
+    }, g_app_name, msg).detach();
+}
+
 
 // =================================================================================
 // TCP 模块
@@ -824,15 +834,21 @@ void UDP_PortForwardingThread(Config base_config) {
 // =================================================================================
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    if (uMsg == WM_APP_EXECUTE_RUN) {
-        Print(CYAN, "[IPC] 收到 -run 命令，正在执行...");
-        wchar_t exe_path_wchar[MAX_PATH];
-        GetModuleFileNameW(NULL, exe_path_wchar, MAX_PATH);
-        PathRemoveFileSpecW(exe_path_wchar);
-        std::wstring iniPath = std::wstring(exe_path_wchar) + L"\\" + g_app_name + L".ini";
-        Config config = ReadIniConfig(iniPath);
-        ExecuteRunCommand(config);
-        return 0;
+    switch (uMsg) {
+        case WM_APP_EXECUTE_RUN: {
+            Print(CYAN, "[IPC] 收到 -run 命令，正在执行...");
+            wchar_t exe_path_wchar[MAX_PATH];
+            GetModuleFileNameW(NULL, exe_path_wchar, MAX_PATH);
+            PathRemoveFileSpecW(exe_path_wchar);
+            std::wstring iniPath = std::wstring(exe_path_wchar) + L"\\" + g_app_name + L".ini";
+            Config config = ReadIniConfig(iniPath);
+            ExecuteRunCommand(config);
+            return 0;
+        }
+        case WM_APP_SHOW_NOTIFICATION: { // 【新】处理 -show 命令
+            TriggerManualNotification();
+            return 0;
+        }
     }
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
@@ -844,9 +860,11 @@ int main(int argc, char* argv[]) {
     WSAStartup(MAKEWORD(2, 2), &wsaData);
 
     bool run_command_only = false;
+    bool show_command_only = false; // 【新】
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-hide") == 0) g_is_hidden = true;
         if (strcmp(argv[i], "-run") == 0) run_command_only = true;
+        if (strcmp(argv[i], "-show") == 0) show_command_only = true; // 【新】
     }
 
     wchar_t exe_path_wchar[MAX_PATH];
@@ -857,10 +875,13 @@ int main(int argc, char* argv[]) {
 
     HANDLE hMutex = CreateMutexW(NULL, TRUE, g_app_name.c_str());
     if (hMutex != NULL && GetLastError() == ERROR_ALREADY_EXISTS) {
-        if (run_command_only) {
-            HWND hExistingWnd = FindWindowW(g_app_name.c_str(), NULL);
-            if (hExistingWnd) {
+        HWND hExistingWnd = FindWindowW(g_app_name.c_str(), NULL);
+        if (hExistingWnd) {
+            if (run_command_only) {
                 SendMessageW(hExistingWnd, WM_APP_EXECUTE_RUN, 0, 0);
+            }
+            if (show_command_only) { // 【新】
+                SendMessageW(hExistingWnd, WM_APP_SHOW_NOTIFICATION, 0, 0);
             }
         }
         CloseHandle(hMutex);
@@ -873,7 +894,7 @@ int main(int argc, char* argv[]) {
     } else {
         if (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole()) {
             SetConsoleOutputCP(65001);
-            SetConsoleTitleW(g_app_name.c_str()); // 设置控制台标题
+            SetConsoleTitleW(g_app_name.c_str());
             FILE* fDummy;
             freopen_s(&fDummy, "CONOUT$", "w", stdout);
             freopen_s(&fDummy, "CONOUT$", "w", stderr);
