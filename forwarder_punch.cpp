@@ -1,167 +1,115 @@
-// main.cpp (最终答案版)
-// 核心修复：在单线程单元 (STA) 中初始化COM/WinRT环境
+// main.cpp
+// 最终验证方案：“阅后即焚”的托盘图标用法
+// 点击窗口上的按钮，会临时创建一个托盘图标，发送一个通知，然后立即销毁图标。
+// 通知本身会被系统接管并保留在通知中心，但将变得不可交互。
 
 #ifndef UNICODE
 #define UNICODE
 #endif
 
 #include <windows.h>
-#include <shobjidl.h>
-#include <propsys.h>
-#include <propkey.h>
-#include <propvarutil.h>
-#include <string>
-#include <shlobj.h>
-#include <winrt/Windows.UI.Notifications.h>
-#include <winrt/Windows.Data.Xml.Dom.h>
+#include <shellapi.h> // For Shell_NotifyIcon and NOTIFYICONDATA
 
-#pragma comment(lib, "user32.lib")
+// 自动链接所需的库
 #pragma comment(lib, "shell32.lib")
-#pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "propsys.lib")
-#pragma comment(lib, "windowsapp.lib")
+#pragma comment(lib, "user32.lib")
 
-const wchar_t* AUMID = L"MyCompany.TheFinalAnswerApp.1";
-const wchar_t* SHORTCUT_NAME = L"FinalAnswer.lnk";
+// 全局常量
+const wchar_t CLASS_NAME[] = L"FireAndForgetTrayApp";
+const int ID_BUTTON_SHOW_ZOMBIE_TOAST = 101; // 按钮的ID
 
-// 函数原型无需改变
+// 函数原型
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
-bool SetAumidForWindow(HWND hwnd, const wchar_t* aumid);
-void SendToastNotification(const wchar_t* aumid);
-bool InstallShortcut(const wchar_t* shortcutName, const wchar_t* aumid);
-void RemoveShortcut(const wchar_t* shortcutName);
-std::wstring GetStartMenuProgramsPath();
+void ShowFireAndForgetBalloon(HWND hwnd);
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow)
 {
-    // --- 决定性的、唯一的修复 ---
-    // 初始化一个单线程单元 (STA)。所有UI相关的COM/WinRT操作都必须在这里进行。
-    winrt::init_apartment(winrt::apartment_type::single_threaded);
-    
-    // CoInitialize现在不再需要，因为winrt::init_apartment已经处理了
-    // CoInitialize(NULL); 
-
-    if (!InstallShortcut(SHORTCUT_NAME, AUMID)) {
-        MessageBox(NULL, L"无法创建开始菜单快捷方式。", L"错误", MB_OK);
-        return 0;
-    }
-    
-    atexit([] { RemoveShortcut(SHORTCUT_NAME); });
-
-    const wchar_t CLASS_NAME[] = L"FinalAnswerSample";
-    WNDCLASS wc = { };
+    // 1. 注册窗口类
+    WNDCLASS wc = {};
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = hInstance;
     wc.lpszClassName = CLASS_NAME;
     RegisterClass(&wc);
 
+    // 2. 创建一个可见的窗口
     HWND hwnd = CreateWindowEx(
-        0, CLASS_NAME, L"最终答案验证", WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, 400, 300,
+        0, CLASS_NAME, L"C++ 阅后即焚通知", WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, 350, 200, // 窗口大小
         NULL, NULL, hInstance, NULL
     );
 
-    if (hwnd == NULL) return 0;
+    if (hwnd == NULL)
+    {
+        return 0;
+    }
 
-    SetAumidForWindow(hwnd, AUMID);
+    // 3. 在窗口上创建一个按钮
+    CreateWindow(
+        L"BUTTON",
+        L"发送一个“僵尸”通知", // 按钮文本
+        WS_TABSTOP | WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON,
+        50, 50, 230, 50, // 按钮位置和大小
+        hwnd,
+        (HMENU)ID_BUTTON_SHOW_ZOMBIE_TOAST,
+        (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE),
+        NULL
+    );
 
+    // 4. 显示窗口
     ShowWindow(hwnd, nCmdShow);
-    UpdateWindow(hwnd);
-    
-    SendToastNotification(AUMID);
-    
-    MSG msg = { };
-    while (GetMessage(&msg, NULL, 0, 0)) {
+
+    // 5. 标准消息循环
+    MSG msg = {};
+    while (GetMessage(&msg, NULL, 0, 0))
+    {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
-    
+
     return 0;
 }
 
-// WindowProc, SetAumidForWindow, SendToastNotification 
-// GetStartMenuProgramsPath 函数保持不变
-LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    if (uMsg == WM_DESTROY) { PostQuitMessage(0); return 0; }
+// 窗口消息处理函数
+LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+    switch (uMsg)
+    {
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+
+    case WM_COMMAND: // 处理按钮点击
+        if (LOWORD(wParam) == ID_BUTTON_SHOW_ZOMBIE_TOAST)
+        {
+            // 点击按钮时，执行“阅后即焚”操作
+            ShowFireAndForgetBalloon(hwnd);
+        }
+        return 0;
+    }
+
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
-bool SetAumidForWindow(HWND hwnd, const wchar_t* aumid) {
-    IPropertyStore* pps;
-    if (SUCCEEDED(SHGetPropertyStoreForWindow(hwnd, IID_PPV_ARGS(&pps)))) {
-        PROPVARIANT pvAumid;
-        if (SUCCEEDED(InitPropVariantFromString(aumid, &pvAumid))) {
-            pps->SetValue(PKEY_AppUserModel_ID, pvAumid);
-            PropVariantClear(&pvAumid);
-        }
-        pps->Release();
-        return true;
-    }
-    return false;
-}
-void SendToastNotification(const wchar_t* aumid) {
-    try {
-        auto notifier = winrt::Windows::UI::Notifications::ToastNotificationManager::CreateToastNotifier(aumid);
-        winrt::Windows::Data::Xml::Dom::XmlDocument toastXml;
-        std::wstring xml = L"<toast><visual><binding template='ToastGeneric'><text>终极验证成功！</text><text>COM线程模型 (STA) 是最后的关键。</text></binding></visual></toast>";
-        toastXml.LoadXml(xml);
-        winrt::Windows::UI::Notifications::ToastNotification notification(toastXml);
-        notifier.Show(notification);
-    }
-    catch (const winrt::hresult_error& e) {
-        MessageBox(NULL, e.message().c_str(), L"Toast 发送失败", MB_OK);
-    }
-}
-std::wstring GetStartMenuProgramsPath() {
-    PWSTR pszPath = NULL;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Programs, 0, NULL, &pszPath))) {
-        std::wstring path = pszPath;
-        CoTaskMemFree(pszPath);
-        return path;
-    }
-    return L"";
-}
 
-// 包含SHChangeNotify的快捷方式函数 (不变)
-bool InstallShortcut(const wchar_t* shortcutName, const wchar_t* aumid) {
-    std::wstring shortcutPath = GetStartMenuProgramsPath();
-    if (shortcutPath.empty()) return false;
-    shortcutPath += L"\\" + std::wstring(shortcutName);
-    wchar_t exePath[MAX_PATH];
-    GetModuleFileNameW(NULL, exePath, MAX_PATH);
-    IShellLink* psl = NULL;
-    HRESULT hr = CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLink, (LPVOID*)&psl);
-    if (SUCCEEDED(hr)) {
-        psl->SetPath(exePath);
-        IPropertyStore* pps = NULL;
-        hr = psl->QueryInterface(IID_IPropertyStore, (void**)&pps);
-        if (SUCCEEDED(hr)) {
-            PROPVARIANT pvAumid;
-            hr = InitPropVariantFromString(aumid, &pvAumid);
-            if (SUCCEEDED(hr)) {
-                hr = pps->SetValue(PKEY_AppUserModel_ID, pvAumid);
-                PropVariantClear(&pvAumid);
-            }
-            pps->Release();
-        }
-        IPersistFile* ppf = NULL;
-        hr = psl->QueryInterface(IID_IPersistFile, (void**)&ppf);
-        if (SUCCEEDED(hr)) {
-            hr = ppf->Save(shortcutPath.c_str(), TRUE);
-            ppf->Release();
-        }
-        psl->Release();
-    }
-    if (SUCCEEDED(hr)) {
-        SHChangeNotify(SHCNE_CREATE, SHCNF_PATH, shortcutPath.c_str(), NULL);
-        Sleep(100); 
-    }
-    return SUCCEEDED(hr);
-}
-void RemoveShortcut(const wchar_t* shortcutName) {
-    std::wstring shortcutPath = GetStartMenuProgramsPath();
-    if (shortcutPath.empty()) return;
-    shortcutPath += L"\\" + std::wstring(shortcutName);
-    if(DeleteFileW(shortcutPath.c_str())) {
-        SHChangeNotify(SHCNE_DELETE, SHCNF_PATH, shortcutPath.c_str(), NULL);
-    }
+// “阅后即焚”核心函数
+void ShowFireAndForgetBalloon(HWND hwnd)
+{
+    // 1. 准备 NOTIFYICONDATA 结构体
+    NOTIFYICONDATA nid = {};
+    nid.cbSize = sizeof(NOTIFYICONDATA);
+    nid.hWnd = hwnd;
+    nid.uID = 200; // 使用一个唯一的ID，避免与可能存在的其他图标冲突
+    nid.uFlags = NIF_ICON | NIF_INFO; // 我们只需要设置图标和气泡信息
+    nid.dwInfoFlags = NIIF_INFO;
+    nid.hIcon = LoadIcon(NULL, IDI_INFORMATION); // 使用一个信息图标
+    lstrcpyW(nid.szInfoTitle, L"我是“僵尸”通知");
+    lstrcpyW(nid.szInfo, L"我的发送者（托盘图标）已经消失了。你点击我不会有任何反应。");
+
+    // 2. 【发射】添加图标并立即显示气泡
+    // NIM_ADD 会创建图标并处理 NIF_INFO 标志来显示气泡
+    Shell_NotifyIcon(NIM_ADD, &nid);
+
+    // 3. 【遗忘】几乎立即发送删除图标的命令
+    // 注意：这里的删除操作是异步的。你发出命令，Shell会在稍后处理。
+    // 这给了Shell足够的时间来处理之前的NIM_ADD命令中的通知部分。
+    Shell_NotifyIcon(NIM_DELETE, &nid);
 }
