@@ -1,10 +1,11 @@
-name: Build C++ UDP Forwarder for Windows (using MinGW)
+name: Build C++ UDP Forwarder for Windows
 
 on:
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  # 允许手动触发工作流
   workflow_dispatch:
 
 jobs:
@@ -15,23 +16,17 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Set up MinGW-w64
-      # 使用这个 action 来安装 GCC 编译器
-      uses: egor-tensin/setup-mingw@v2
-      with:
-        platform: x64
+    - name: Setup MSVC Developer Command Prompt
+      uses: ilammy/msvc-dev-cmd@v1
 
-    - name: Compile C++ code with GCC
-      # 使用 g++ 编译器，并包含对 GCC 至关重要的 -pthread 参数
-      run: g++ -std=c++17 -o udp_forwarder.exe forwarder_punch.cpp -lws2_32 -lshlwapi -static -pthread
-      shell: bash
+    - name: Compile C++ code
+      run: cl.exe forwarder_punch.cpp /std:c++17 /EHsc /O2 /D "UNICODE" /D "_UNICODE" /utf-8 /Fe:udp_forwarder.exe /link Ws2_32.lib Shlwapi.lib
 
     - name: Prepare artifact for upload
       run: |
         mkdir release
-        cp udp_forwarder.exe release/
-        cp config.ini release/
-      shell: bash
+        copy udp_forwarder.exe release\
+        copy config.ini release\
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
