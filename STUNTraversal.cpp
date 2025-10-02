@@ -594,7 +594,7 @@ void TCP_PortForwardingThread(Config base_config) {
         }
 
         // 阶段二: 切换到 KeepAliveHost 维持端口
-        Print(CYAN, "[TCP] 维持: 正在连接保活服务器 ", *config.keep_alive_host, ":443...");
+        Print(CYAN, "[TCP] 维持: 正在连接保活服务器 ", *config.keep_alive_host, ":80...");
         keep_alive_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         listener_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 
@@ -614,7 +614,7 @@ void TCP_PortForwardingThread(Config base_config) {
 
         addrinfo* ka_res = nullptr;
         bool ka_connected = false;
-        if (getaddrinfo(config.keep_alive_host->c_str(), "443", nullptr, &ka_res) == 0) {
+        if (getaddrinfo(config.keep_alive_host->c_str(), "80", nullptr, &ka_res) == 0) {
             if (connect(keep_alive_sock, ka_res->ai_addr, (int)ka_res->ai_addrlen) == 0) {
                 ka_connected = true;
             }
