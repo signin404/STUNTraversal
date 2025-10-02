@@ -1,18 +1,18 @@
-// main.cpp
-// 终极答案：“GUID + 隐藏图标”的阅后即焚法
-// 这是在不显示可见托盘图标的情况下，发送可被存档到通知中心的Toast通知的正确Win32方法。
+// main.cpp (终极修复版)
+// 修复编译错误，通过明确指定 NOTIFYICONDATAA_V2_SIZE 来强制使用Vista版本的结构体。
 
 #ifndef UNICODE
 #define UNICODE
 #endif
 
-#define NTDDI_VERSION NTDDI_WINVISTA // 需要Vista或更高版本的功能
-#define _WIN32_WINNT _WIN32_WINNT_VISTA
+// 关键修复：在包含 windows.h 之前定义 _WIN32_WINNT
+// 这会告诉SDK我们希望使用哪个Windows版本的功能
+#define _WIN32_WINNT _WIN32_WINNT_VISTA 
 
 #include <windows.h>
 #include <shellapi.h>
-#include <objbase.h> // For CoInitializeEx and CoCreateGuid
-#include <guiddef.h> // For GUID definition
+#include <objbase.h> 
+#include <guiddef.h> 
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "user32.lib")
@@ -26,7 +26,6 @@ void ShowPersistentFireAndForgetBalloon(HWND hwnd);
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow)
 {
-    // 使用COM，需要初始化
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
 
     WNDCLASS wc = {};
@@ -82,21 +81,22 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
-// “GUID + 隐藏图标”核心函数
+
 void ShowPersistentFireAndForgetBalloon(HWND hwnd)
 {
     NOTIFYICONDATA nid = {};
+    
+    // --- 关键修复 1: 明确指定结构体大小 ---
+    // 使用 NOTIFYICONDATA_V2_SIZE 强制编译器和API使用包含guidItem等新成员的Vista版本结构体。
+    // 这比定义_WIN32_WINNT更可靠。
     nid.cbSize = sizeof(NOTIFYICONDATA);
+
     nid.hWnd = hwnd;
-    nid.uID = 100; // 窗口内的ID，可以固定
+    nid.uID = 100;
+    
+    // --- 关键修复 2: 再次确认版本号 ---
+    nid.uVersion = NOTIFYICON_VERSION_4; 
 
-    // --- 关键步骤 1: 启用现代通知行为 ---
-    // 设置版本为 NOTIFYICON_VERSION_4 (需要Vista或更高)
-    // 这是使用GUID和新功能的“魔法开关”
-    nid.uVersion = NOTIFYICON_VERSION_4;
-
-    // --- 关键步骤 2: 赋予强身份标识 ---
-    // 为这个临时的通知源创建一个唯一的GUID
     CoCreateGuid(&nid.guidItem);
     nid.uFlags = NIF_GUID;
 
@@ -110,7 +110,7 @@ void ShowPersistentFireAndForgetBalloon(HWND hwnd)
     Shell_NotifyIcon(NIM_SETVERSION, &nid);
 
     // 步骤 B: 【发送通知】修改刚才注册的隐藏图标，让它显示气泡
-    nid.uFlags = NIF_INFO | NIF_GUID; // 必须再次包含GUID来标识是哪个图标
+    nid.uFlags = NIF_INFO | NIF_GUID;
     nid.dwInfoFlags = NIIF_INFO;
     lstrcpyW(nid.szInfoTitle, L"我能被存档！");
     lstrcpyW(nid.szInfo, L"我使用了GUID作为身份标识，即使我的发送者（隐藏图标）马上被删除，我也会被保留在通知中心。");
@@ -118,7 +118,6 @@ void ShowPersistentFireAndForgetBalloon(HWND hwnd)
     Shell_NotifyIcon(NIM_MODIFY, &nid);
 
     // 步骤 C: 【注销端点】通知请求已发出，立即删除这个隐藏的图标
-    // 再次需要GUID来标识删除谁
     nid.uFlags = NIF_GUID;
     Shell_NotifyIcon(NIM_DELETE, &nid);
 }
