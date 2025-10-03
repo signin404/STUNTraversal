@@ -447,7 +447,7 @@ void TCP_HandleNewConnection(SOCKET peer_sock, Config config) {
     for (int attempt = 0; attempt < 2; ++attempt) {
         target_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (target_sock == INVALID_SOCKET) {
-            Print(RED, "[TCP] 创建本地 Socket 失败。");
+            Print(RED, "[TCP] 创建本地 Socket 失败");
             closesocket(peer_sock);
             return;
         }
@@ -459,7 +459,7 @@ void TCP_HandleNewConnection(SOCKET peer_sock, Config config) {
             Print(RED, "[TCP] 无法连接本地目标 ", *config.tcp_forward_host, ":", *config.tcp_forward_port);
             closesocket(target_sock);
             freeaddrinfo(fwd_res);
-            // 如果第一次都连不上，就没必要重试了
+            // 如果第一次都连不上 就没必要重试了
             break; 
         }
         freeaddrinfo(fwd_res);
@@ -481,28 +481,28 @@ void TCP_HandleNewConnection(SOCKET peer_sock, Config config) {
             int check_result = recv(target_sock, &dummy_buffer, 1, MSG_PEEK);
 
             if (check_result == 0 || (check_result == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK)) {
-                // 连接被关闭，说明不支持 PROXY 协议
+                // 连接被关闭 说明不支持 PROXY 协议
                 if (current_state == ProxySupportState::UNKNOWN) {
-                    Print(YELLOW, "[TCP] PROXY: 检测到本地应用不支持代理协议，已禁用该功能并自动重试。");
+                    Print(YELLOW, "[TCP] PROXY: 检测到本地应用不支持代理协议 已禁用该功能并自动重试");
                     g_proxy_support_state.store(ProxySupportState::UNSUPPORTED);
                     closesocket(target_sock); // 关闭失败的连接
-                    continue; // 进入下一次循环，进行无协议头的重连
+                    continue; // 进入下一次循环 进行无协议头的重连
                 }
             } else {
-                // 连接存活，说明支持 PROXY 协议
+                // 连接存活 说明支持 PROXY 协议
                 if (current_state == ProxySupportState::UNKNOWN) {
-                    Print(GREEN, "[TCP] PROXY: 检测到本地应用支持代理协议，已启用该功能。");
+                    Print(GREEN, "[TCP] PROXY: 检测到本地应用支持代理协议 已启用该功能");
                     g_proxy_support_state.store(ProxySupportState::SUPPORTED);
                 }
-                Print(YELLOW, "[TCP] PROXY: 已发送原始 IP ", peer_ip_str, " 至本地应用。");
+                Print(YELLOW, "[TCP] PROXY: 已发送原始 IP ", peer_ip_str, " 至本地应用");
                 connection_established = true;
             }
         } else {
-            // 明确知道不支持，或者这是失败后的重试，直接建立连接
+            // 明确知道不支持 或者这是失败后的重试 直接建立连接
             connection_established = true;
         }
         
-        // 如果连接成功建立，就跳出循环
+        // 如果连接成功建立 就跳出循环
         if (connection_established) {
             break;
         }
@@ -513,9 +513,9 @@ void TCP_HandleNewConnection(SOCKET peer_sock, Config config) {
         std::thread(TCP_Proxy, peer_sock, target_sock, config.keep_alive_ms).detach();
         std::thread(TCP_Proxy, target_sock, peer_sock, config.keep_alive_ms).detach();
     } else {
-        Print(RED, "[TCP] 建立本地连接最终失败。");
+        Print(RED, "[TCP] 建立本地连接最终失败");
         closesocket(peer_sock);
-        // target_sock 可能已经关闭，再关一次也无妨
+        // target_sock 可能已经关闭 再关一次也无妨
         if (target_sock != INVALID_SOCKET) {
             closesocket(target_sock);
         }
