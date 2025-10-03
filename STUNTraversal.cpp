@@ -428,9 +428,9 @@ void TCP_Proxy(SOCKET s1, SOCKET s2, int keep_alive_ms) {
 }
 
 // 【新】实现了自动检测与回退机制的 TCP_HandleNewConnection
-// 【最终版】回归纯粹的透明转发，兼容所有 P2P 软件
-// 这个版本虽然不发送 PROXY 头，但它的逻辑是正确的，不会有竞争条件。
-// 如果你要重新实现 PROXY 协议，必须基于这个正确的逻辑顺序。
+// 【最终版】回归纯粹的透明转发 兼容所有 P2P 软件
+// 这个版本虽然不发送 PROXY 头 但它的逻辑是正确的 不会有竞争条件
+// 如果你要重新实现 PROXY 协议 必须基于这个正确的逻辑顺序
 void TCP_HandleNewConnection(SOCKET peer_sock, Config config) {
     sockaddr_in peer_addr; 
     int peer_addr_len = sizeof(peer_addr);
@@ -444,7 +444,7 @@ void TCP_HandleNewConnection(SOCKET peer_sock, Config config) {
     
     SOCKET target_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (target_sock == INVALID_SOCKET) {
-        Print(RED, "[TCP] 创建本地 Socket 失败。");
+        Print(RED, "[TCP] 创建本地 Socket 失败");
         closesocket(peer_sock);
         return;
     }
@@ -460,14 +460,14 @@ void TCP_HandleNewConnection(SOCKET peer_sock, Config config) {
         closesocket(peer_sock);
         closesocket(target_sock);
     } else {
-        // --- 如果你要重新实现 PROXY 协议，必须在这里 ---
+        // --- 如果你要重新实现 PROXY 协议 必须在这里 ---
         // 1. 构建 PROXY 协议头字符串
          std::string header = "PROXY TCP4 ...";
-        // 2. 发送协议头，并检查错误
+        // 2. 发送协议头 并检查错误
          if (send(target_sock, header.c_str(), header.length(), 0) == SOCKET_ERROR) {
-        //     // 处理错误，关闭 sockets
+        //     // 处理错误 关闭 sockets
          } else {
-        //     // 3. 只有在发送成功后，才启动转发线程
+        //     // 3. 只有在发送成功后 才启动转发线程
              Print(YELLOW, "[TCP] 开始转发...");
              std::thread(TCP_Proxy, peer_sock, target_sock, config.keep_alive_ms).detach();
              std::thread(TCP_Proxy, target_sock, peer_sock, config.keep_alive_ms).detach();
@@ -482,6 +482,7 @@ void TCP_HandleNewConnection(SOCKET peer_sock, Config config) {
     if (fwd_res != nullptr) {
         freeaddrinfo(fwd_res);
     }
+}
 }
 
 void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config& config, int local_port) {
