@@ -916,6 +916,8 @@ void UDP_PortForwardingThread(Config base_config) {
         if (config.udp_forward_port == 0) {
             config.udp_forward_port = public_port;
             Print(CYAN, "[UDP] 动态转发端口已设置为公网端口: ", *config.udp_forward_port);
+        } else {
+            Print(CYAN, "[UDP] 转发端口已设置为: ", *config.udp_forward_port);
         }
 
         Print(LIGHT_GREEN, "[UDP] 成功！公网端口 ", public_ip, ":", public_port, " 已开启");
