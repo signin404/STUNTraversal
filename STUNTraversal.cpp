@@ -35,6 +35,12 @@
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup")
 
 // 全局定义和辅助工具
+// 【新】用于存储连接对的数据结构
+struct ConnectionPair {
+    SOCKET client_socket; // 来自公网的连接
+    SOCKET local_socket;  // 连接到本地P2P软件的连接
+};
+
 std::atomic<bool> g_tcp_reconnect_flag{false};
 std::atomic<bool> g_udp_reconnect_flag{false};
 std::atomic<bool> g_tcp_ready{false};
@@ -119,8 +125,8 @@ struct Config {
     std::optional<std::string> run_path;
     std::optional<std::string> run_cmd;
     std::optional<std::string> keep_alive_host;
-    // 【改】变量名和单位已更新为秒
-    int monitor_interval_sec = 300; 
+    int monitor_interval_sec = 300;
+    int keep_alive_retry = 3; // 【新】保活服务器连接重试次数
 };
 
 Config ReadIniConfig(const std::wstring& filePath) {
@@ -192,8 +198,8 @@ Config ReadIniConfig(const std::wstring& filePath) {
                     else if (key_w == L"run") config.run_path = value;
                     else if (key_w == L"runcmd") config.run_cmd = value;
                     else if (key_w == L"keepalivehost") config.keep_alive_host = value;
-                    // 【改】读取新的配置项 monitorintervalsec
                     else if (key_w == L"monitorintervalsec") config.monitor_interval_sec = std::stoi(value);
+                    else if (key_w == L"keepaliveretry") config.keep_alive_retry = std::stoi(value);
                 } catch (const std::exception&) { /* ignore bad values */ }
             }
         }
@@ -445,7 +451,7 @@ void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
         std::this_thread::sleep_for(std::chrono::seconds(config.monitor_interval_sec));
         if (g_tcp_reconnect_flag) break;
 
-        // Print(CYAN, "\n[TCP] 监控: 正在检查公网地址...");
+        Print(CYAN, "\n[TCP] 监控: 正在检查公网地址...");
         
         bool overall_check_success = false;
         std::string current_ip; 
@@ -528,8 +534,136 @@ void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
     }
 }
 
-// 【改】TCP 模块 - 采用角色分离方案
-// 【修复】TCP 模块 - 修复保活逻辑
+// 【新】单线程代理循环 处理所有连接
+void TCP_SingleThreadProxyLoop(SOCKET listener_sock, SOCKET keep_alive_sock, const Config& config) {
+    std::map<SOCKET, ConnectionPair> connections;
+    char buffer[8192];
+
+    std::string ka_host = *config.keep_alive_host;
+    std::string keep_alive_packet = "HEAD / HTTP/1.1\r\nHost: " + ka_host + "\r\nConnection: keep-alive\r\n\r\n";
+    auto last_keepalive_time = std::chrono::steady_clock::now();
+
+    while (!g_tcp_reconnect_flag) {
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+
+        FD_SET(listener_sock, &read_fds);
+        FD_SET(keep_alive_sock, &read_fds);
+        SOCKET max_sd = max(listener_sock, keep_alive_sock);
+
+        for (const auto& pair : connections) {
+            FD_SET(pair.second.client_socket, &read_fds);
+            FD_SET(pair.second.local_socket, &read_fds);
+            max_sd = max(max_sd, pair.second.client_socket);
+            max_sd = max(max_sd, pair.second.local_socket);
+        }
+
+        timeval timeout;
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+
+        int activity = select(max_sd + 1, &read_fds, NULL, NULL, &timeout);
+
+        if (activity == SOCKET_ERROR) {
+            g_tcp_reconnect_flag = true;
+            break;
+        }
+
+        if (FD_ISSET(listener_sock, &read_fds)) {
+            sockaddr_in client_addr;
+            int client_addr_len = sizeof(client_addr);
+            SOCKET new_client_socket = accept(listener_sock, (sockaddr*)&client_addr, &client_addr_len);
+
+            if (new_client_socket != INVALID_SOCKET) {
+                char client_ip_str[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &client_addr.sin_addr, client_ip_str, sizeof(client_ip_str));
+                int client_port = ntohs(client_addr.sin_port);
+
+                if (config.tcp_forward_host && !config.tcp_forward_host->empty()) {
+                    SOCKET new_local_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                    addrinfo* fwd_res = nullptr;
+                    getaddrinfo(config.tcp_forward_host->c_str(), std::to_string(*config.tcp_forward_port).c_str(), nullptr, &fwd_res);
+                    if (connect(new_local_socket, fwd_res->ai_addr, (int)fwd_res->ai_addrlen) == 0) {
+                        // 【改】合并日志语句 并恢复为旧格式
+                        Print(YELLOW, "[TCP] 开始转发 ", client_ip_str, " <==> ", *config.tcp_forward_host, ":", *config.tcp_forward_port);
+                        connections[new_client_socket] = { new_client_socket, new_local_socket };
+                        connections[new_local_socket] = { new_client_socket, new_local_socket };
+                    } else {
+                        Print(RED, "[TCP] 无法连接本地目标 来自 ", client_ip_str, ":", client_port, " 的连接已关闭");
+                        closesocket(new_client_socket);
+                        closesocket(new_local_socket);
+                    }
+                    freeaddrinfo(fwd_res);
+                } else {
+                    Print(CYAN, "[TCP] 仅打洞模式 来自 ", client_ip_str, ":", client_port, " 的连接已接受并立即关闭");
+                    closesocket(new_client_socket);
+                }
+            }
+        }
+
+        if (FD_ISSET(keep_alive_sock, &read_fds)) {
+            int bytes = recv(keep_alive_sock, buffer, sizeof(buffer), 0);
+            if (bytes <= 0) {
+                Print(RED, "[TCP] 维持: 与保活服务器的连接已关闭");
+                g_tcp_reconnect_flag = true;
+                break;
+            }
+        }
+
+        for (auto it = connections.begin(); it != connections.end(); ) {
+            bool connection_closed = false;
+            SOCKET source_sock = it->first;
+            
+            if (FD_ISSET(source_sock, &read_fds)) {
+                SOCKET target_sock = (source_sock == it->second.client_socket) ? it->second.local_socket : it->second.client_socket;
+                int bytes = recv(source_sock, buffer, sizeof(buffer), 0);
+                if (bytes > 0) {
+                    if (send(target_sock, buffer, bytes, 0) <= 0) {
+                        connection_closed = true;
+                    }
+                } else {
+                    connection_closed = true;
+                }
+            }
+
+            if (connection_closed) {
+                // Print(YELLOW, "[TCP] 连接关闭 清理通道");
+                closesocket(it->second.client_socket);
+                closesocket(it->second.local_socket);
+                SOCKET s1 = it->second.client_socket;
+                SOCKET s2 = it->second.local_socket;
+                connections.erase(s1);
+                it = connections.find(s2);
+                if (it != connections.end()) {
+                    it = connections.erase(it);
+                } else {
+                    it = connections.begin();
+                }
+            } else {
+                ++it;
+            }
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_keepalive_time).count() > config.keep_alive_ms) {
+            if (send(keep_alive_sock, keep_alive_packet.c_str(), keep_alive_packet.length(), 0) == SOCKET_ERROR) {
+                Print(RED, "[TCP] 维持: 发送保活包失败");
+                g_tcp_reconnect_flag = true;
+                break;
+            }
+            last_keepalive_time = now;
+        }
+    }
+
+    for (auto const& [key, val] : connections) {
+        if (key == val.client_socket) {
+            closesocket(val.client_socket);
+            closesocket(val.local_socket);
+        }
+    }
+}
+
+// 完整的 TCP_PortForwardingThread 函数 (包含保活连接重试逻辑)
 void TCP_PortForwardingThread(Config base_config) {
     winrt::init_apartment();
 
@@ -548,7 +682,7 @@ void TCP_PortForwardingThread(Config base_config) {
         std::string public_ip; int public_port;
         bool stun_success = false;
 
-        Print(WHITE, "\n--- [TCP] 开始新一轮端口穿透尝试 ---");
+        Print(WHITE, "\n--- [TCP] 开始新一轮端口开启尝试 ---");
 
         // 阶段一: 使用 STUN 服务器发现端口
         for (const auto& server_str : config.stun_servers) {
@@ -604,7 +738,7 @@ void TCP_PortForwardingThread(Config base_config) {
         g_tcp_port_str = std::to_string(public_port);
         if (config.tcp_forward_port == 0) {
             config.tcp_forward_port = public_port;
-            Print(CYAN, "[TCP] 转发端口已设置为公网端口: ", *config.tcp_forward_port);
+            Print(CYAN, "[TCP] 动态转发端口已设置为公网端口: ", *config.tcp_forward_port);
         }
 
         // 阶段二: 切换到 KeepAliveHost 维持端口
@@ -628,15 +762,25 @@ void TCP_PortForwardingThread(Config base_config) {
 
         addrinfo* ka_res = nullptr;
         bool ka_connected = false;
-        if (getaddrinfo(config.keep_alive_host->c_str(), "80", nullptr, &ka_res) == 0) {
-            if (connect(keep_alive_sock, ka_res->ai_addr, (int)ka_res->ai_addrlen) == 0) {
-                ka_connected = true;
+        
+        for (int retry_count = 0; retry_count < config.keep_alive_retry; ++retry_count) {
+            if (getaddrinfo(config.keep_alive_host->c_str(), "80", nullptr, &ka_res) == 0) {
+                if (connect(keep_alive_sock, ka_res->ai_addr, (int)ka_res->ai_addrlen) == 0) {
+                    ka_connected = true;
+                    freeaddrinfo(ka_res);
+                    break; 
+                }
+                freeaddrinfo(ka_res);
             }
-            freeaddrinfo(ka_res);
+            
+            if (retry_count < config.keep_alive_retry - 1) {
+                Print(YELLOW, "[TCP] 维持: 连接保活服务器失败 3秒后重试 (", retry_count + 1, "/", config.keep_alive_retry, ")...");
+                std::this_thread::sleep_for(std::chrono::seconds(3));
+            }
         }
 
         if (!ka_connected) {
-            Print(RED, "[TCP] 维持: 连接保活服务器失败 重启流程...");
+            Print(RED, "[TCP] 维持: 连接保活服务器失败 所有重试均告失败 重启流程...");
             closesocket(keep_alive_sock); closesocket(listener_sock);
             if (config.auto_retry) std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms));
             continue;
@@ -644,6 +788,7 @@ void TCP_PortForwardingThread(Config base_config) {
         
         Print(LIGHT_GREEN, "[TCP] 维持: 成功连接保活服务器 端口已开启并监听");
         g_tcp_ready = true;
+        
         while (!CheckAndExecuteRun(base_config, base_config.tcp_listen_port.has_value(), base_config.udp_listen_port.has_value())) {
             if (g_tcp_reconnect_flag || g_udp_reconnect_flag) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -651,61 +796,10 @@ void TCP_PortForwardingThread(Config base_config) {
         
         std::thread(TCP_StunCheckThread, public_ip, public_port, config, *config.tcp_listen_port).detach();
 
-        auto last_keepalive_time = std::chrono::steady_clock::now();
-        std::string ka_host = *config.keep_alive_host;
-        std::string keep_alive_packet = "HEAD / HTTP/1.1\r\nHost: " + ka_host + "\r\nConnection: keep-alive\r\n\r\n";
+        TCP_SingleThreadProxyLoop(listener_sock, keep_alive_sock, config);
 
-        while (!g_tcp_reconnect_flag) {
-            fd_set read_fds; 
-            FD_ZERO(&read_fds); 
-            FD_SET(listener_sock, &read_fds);
-            FD_SET(keep_alive_sock, &read_fds); // 【新】同时监听保活Socket上的响应数据
-
-            SOCKET max_sd = max(listener_sock, keep_alive_sock);
-
-            timeval timeout; timeout.tv_sec = 1; timeout.tv_usec = 0;
-            int activity = select(max_sd + 1, &read_fds, NULL, NULL, &timeout);
-
-            if (activity == SOCKET_ERROR) { g_tcp_reconnect_flag = true; break; }
-            
-            if (activity > 0) {
-                // 检查是否有新客户端连接
-                if (FD_ISSET(listener_sock, &read_fds)) {
-                    SOCKET peer_sock = accept(listener_sock, NULL, NULL);
-                    if (peer_sock != INVALID_SOCKET) {
-                        if (config.tcp_forward_host && !config.tcp_forward_host->empty()) {
-                            std::thread(TCP_HandleNewConnection, peer_sock, config).detach();
-                        } else {
-                            Print(CYAN, "[TCP] 接受连接并立即关闭 (仅打洞模式)");
-                            closesocket(peer_sock);
-                        }
-                    }
-                }
-
-                // 【新】检查保活服务器是否发回了响应数据
-                if (FD_ISSET(keep_alive_sock, &read_fds)) {
-                    char discard_buffer[4096];
-                    int bytes = recv(keep_alive_sock, discard_buffer, sizeof(discard_buffer), 0);
-                    if (bytes <= 0) { // 如果recv返回0或-1 说明连接已由服务器关闭
-                        Print(RED, "[TCP] 维持: 与保活服务器的连接已由对方关闭");
-                        g_tcp_reconnect_flag = true;
-                        break;
-                    }
-                    // 成功读取并丢弃数据 什么都不用做
-                }
-            }
-
-            auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_keepalive_time).count() > config.keep_alive_ms) {
-                if (send(keep_alive_sock, keep_alive_packet.c_str(), keep_alive_packet.length(), 0) == SOCKET_ERROR) {
-                    Print(RED, "[TCP] 维持: 发送保活包失败 连接可能已断开");
-                    g_tcp_reconnect_flag = true;
-                    break;
-                }
-                last_keepalive_time = now;
-            }
-        }
-        closesocket(listener_sock); closesocket(keep_alive_sock);
+        closesocket(listener_sock);
+        closesocket(keep_alive_sock);
         if (g_tcp_reconnect_flag) {
             Print(YELLOW, "[TCP] 检测到重连信号 重启流程...");
         }
@@ -735,7 +829,7 @@ void UDP_PortForwardingThread(Config base_config) {
         std::map<std::string, UDPSession> sessions;
         sockaddr_in successful_stun_server_addr;
 
-        Print(WHITE, "\n--- [UDP] 开始新一轮端口穿透尝试 ---");
+        Print(WHITE, "\n--- [UDP] 开始新一轮端口开启尝试 ---");
 
         public_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if(public_sock == INVALID_SOCKET) {
@@ -801,7 +895,7 @@ void UDP_PortForwardingThread(Config base_config) {
 
         if (config.udp_forward_port == 0) {
             config.udp_forward_port = public_port;
-            Print(CYAN, "[UDP] 转发端口已设置为公网端口: ", *config.udp_forward_port);
+            Print(CYAN, "[UDP] 动态转发端口已设置为公网端口: ", *config.udp_forward_port);
         }
 
         Print(LIGHT_GREEN, "[UDP] 成功！公网端口 ", public_ip, ":", public_port, " 已开启");
