@@ -534,19 +534,65 @@ void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
     }
 }
 
-// 【新】单线程代理循环 处理所有连接
-void TCP_SingleThreadProxyLoop(SOCKET listener_sock, SOCKET keep_alive_sock, const Config& config) {
+// 【重构】单线程代理循环 - 内部实现“软”恢复 (保活重连)
+void TCP_SingleThreadProxyLoop(SOCKET listener_sock, const Config& config, int local_port) {
     std::map<SOCKET, ConnectionPair> connections;
     char buffer[8192];
 
     std::string ka_host = *config.keep_alive_host;
     std::string keep_alive_packet = "HEAD / HTTP/1.1\r\nHost: " + ka_host + "\r\nConnection: keep-alive\r\n\r\n";
     auto last_keepalive_time = std::chrono::steady_clock::now();
+    
+    SOCKET keep_alive_sock = INVALID_SOCKET;
 
+    // 主循环 仅在需要“硬”重置 (公网IP变化) 时退出
     while (!g_tcp_reconnect_flag) {
+
+        // --- 内部的保活连接管理 ---
+        if (keep_alive_sock == INVALID_SOCKET) {
+            Print(CYAN, "[TCP] 维持: 正在尝试连接保活服务器 ", *config.keep_alive_host, ":80...");
+            bool ka_reconnected = false;
+            for (int retry_count = 0; retry_count < config.keep_alive_retry; ++retry_count) {
+                SOCKET new_ka_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                if (new_ka_sock == INVALID_SOCKET) continue;
+
+                BOOL reuse = TRUE;
+                setsockopt(new_ka_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+                sockaddr_in local_addr = { AF_INET, htons(local_port), {INADDR_ANY} };
+                if (bind(new_ka_sock, (sockaddr*)&local_addr, sizeof(local_addr)) != 0) {
+                    closesocket(new_ka_sock);
+                    continue;
+                }
+
+                addrinfo* ka_res = nullptr;
+                if (getaddrinfo(config.keep_alive_host->c_str(), "80", nullptr, &ka_res) == 0) {
+                    if (connect(new_ka_sock, ka_res->ai_addr, (int)ka_res->ai_addrlen) == 0) {
+                        keep_alive_sock = new_ka_sock;
+                        ka_reconnected = true;
+                        freeaddrinfo(ka_res);
+                        break;
+                    }
+                    freeaddrinfo(ka_res);
+                }
+                closesocket(new_ka_sock);
+                
+                if (retry_count < config.keep_alive_retry - 1) {
+                    Print(YELLOW, "[TCP] 维持: 重连失败 3秒后重试 (", retry_count + 1, "/", config.keep_alive_retry, ")...");
+                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                }
+            }
+
+            if (!ka_reconnected) {
+                Print(RED, "[TCP] 维持: 所有重连尝试均失败 触发完整重连...");
+                g_tcp_reconnect_flag = true; // 软恢复失败 升级为硬恢复
+                continue; // 跳出主循环
+            }
+            Print(LIGHT_GREEN, "[TCP] 维持: 成功连接保活服务器");
+        }
+
+        // --- 主 select 逻辑 ---
         fd_set read_fds;
         FD_ZERO(&read_fds);
-
         FD_SET(listener_sock, &read_fds);
         FD_SET(keep_alive_sock, &read_fds);
         SOCKET max_sd = max(listener_sock, keep_alive_sock);
@@ -561,14 +607,11 @@ void TCP_SingleThreadProxyLoop(SOCKET listener_sock, SOCKET keep_alive_sock, con
         timeval timeout;
         timeout.tv_sec = 1;
         timeout.tv_usec = 0;
-
         int activity = select(max_sd + 1, &read_fds, NULL, NULL, &timeout);
 
-        if (activity == SOCKET_ERROR) {
-            g_tcp_reconnect_flag = true;
-            break;
-        }
+        if (activity < 0) { continue; }
 
+        // ... (处理新连接和数据转发的逻辑与之前版本完全相同) ...
         if (FD_ISSET(listener_sock, &read_fds)) {
             sockaddr_in client_addr;
             int client_addr_len = sizeof(client_addr);
@@ -577,25 +620,23 @@ void TCP_SingleThreadProxyLoop(SOCKET listener_sock, SOCKET keep_alive_sock, con
             if (new_client_socket != INVALID_SOCKET) {
                 char client_ip_str[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &client_addr.sin_addr, client_ip_str, sizeof(client_ip_str));
-                int client_port = ntohs(client_addr.sin_port);
-
+                
                 if (config.tcp_forward_host && !config.tcp_forward_host->empty()) {
                     SOCKET new_local_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                     addrinfo* fwd_res = nullptr;
                     getaddrinfo(config.tcp_forward_host->c_str(), std::to_string(*config.tcp_forward_port).c_str(), nullptr, &fwd_res);
                     if (connect(new_local_socket, fwd_res->ai_addr, (int)fwd_res->ai_addrlen) == 0) {
-                        // 【改】合并日志语句 并恢复为旧格式
                         Print(YELLOW, "[TCP] 开始转发 ", client_ip_str, " <==> ", *config.tcp_forward_host, ":", *config.tcp_forward_port);
                         connections[new_client_socket] = { new_client_socket, new_local_socket };
                         connections[new_local_socket] = { new_client_socket, new_local_socket };
                     } else {
-                        Print(RED, "[TCP] 无法连接本地目标 来自 ", client_ip_str, ":", client_port, " 的连接已关闭");
+                        Print(RED, "[TCP] 无法连接本地目标 来自 ", client_ip_str, " 的连接已关闭");
                         closesocket(new_client_socket);
                         closesocket(new_local_socket);
                     }
                     freeaddrinfo(fwd_res);
                 } else {
-                    Print(CYAN, "[TCP] 仅打洞模式 来自 ", client_ip_str, ":", client_port, " 的连接已接受并立即关闭");
+                    Print(CYAN, "[TCP] 仅打洞模式 来自 ", client_ip_str, " 的连接已接受并立即关闭");
                     closesocket(new_client_socket);
                 }
             }
@@ -604,13 +645,15 @@ void TCP_SingleThreadProxyLoop(SOCKET listener_sock, SOCKET keep_alive_sock, con
         if (FD_ISSET(keep_alive_sock, &read_fds)) {
             int bytes = recv(keep_alive_sock, buffer, sizeof(buffer), 0);
             if (bytes <= 0) {
-                Print(RED, "[TCP] 维持: 与保活服务器的连接已关闭");
-                g_tcp_reconnect_flag = true;
-                break;
+                Print(RED, "[TCP] 维持: 与保活服务器的连接已断开 将尝试自动重连...");
+                closesocket(keep_alive_sock);
+                keep_alive_sock = INVALID_SOCKET;
+                continue; // 立即进入下一次循环 触发重连逻辑
             }
         }
 
         for (auto it = connections.begin(); it != connections.end(); ) {
+            // ... (数据转发和连接清理逻辑与之前版本完全相同) ...
             bool connection_closed = false;
             SOCKET source_sock = it->first;
             
@@ -644,17 +687,21 @@ void TCP_SingleThreadProxyLoop(SOCKET listener_sock, SOCKET keep_alive_sock, con
             }
         }
 
+        // --- 发送保活包 ---
         auto now = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_keepalive_time).count() > config.keep_alive_ms) {
             if (send(keep_alive_sock, keep_alive_packet.c_str(), keep_alive_packet.length(), 0) == SOCKET_ERROR) {
-                Print(RED, "[TCP] 维持: 发送保活包失败");
-                g_tcp_reconnect_flag = true;
-                break;
+                Print(RED, "[TCP] 维持: 发送保活包失败 连接已断开 将尝试自动重连...");
+                closesocket(keep_alive_sock);
+                keep_alive_sock = INVALID_SOCKET;
+                continue; // 立即进入下一次循环 触发重连逻辑
             }
             last_keepalive_time = now;
         }
     }
 
+    // 清理所有剩余的连接
+    if (keep_alive_sock != INVALID_SOCKET) closesocket(keep_alive_sock);
     for (auto const& [key, val] : connections) {
         if (key == val.client_socket) {
             closesocket(val.client_socket);
@@ -663,7 +710,7 @@ void TCP_SingleThreadProxyLoop(SOCKET listener_sock, SOCKET keep_alive_sock, con
     }
 }
 
-// 完整的 TCP_PortForwardingThread 函数 (包含保活连接重试逻辑)
+// 【重构】TCP 主线程 - 仅负责“硬”恢复 (STUN 穿透)
 void TCP_PortForwardingThread(Config base_config) {
     winrt::init_apartment();
 
@@ -678,7 +725,7 @@ void TCP_PortForwardingThread(Config base_config) {
         g_tcp_ready = false;
         g_run_executed_this_cycle = false;
         Config config = base_config;
-        SOCKET listener_sock = INVALID_SOCKET, stun_sock = INVALID_SOCKET, keep_alive_sock = INVALID_SOCKET;
+        SOCKET listener_sock = INVALID_SOCKET, stun_sock = INVALID_SOCKET;
         std::string public_ip; int public_port;
         bool stun_success = false;
 
@@ -686,6 +733,7 @@ void TCP_PortForwardingThread(Config base_config) {
 
         // 阶段一: 使用 STUN 服务器发现端口
         for (const auto& server_str : config.stun_servers) {
+            // ... (STUN 发现逻辑与之前版本完全相同) ...
             if (stun_success) break;
             size_t colon_pos = server_str.find(':');
             if (colon_pos == std::string::npos) continue;
@@ -739,69 +787,41 @@ void TCP_PortForwardingThread(Config base_config) {
         if (config.tcp_forward_port == 0) {
             config.tcp_forward_port = public_port;
             Print(CYAN, "[TCP] 动态转发端口已设置为公网端口: ", *config.tcp_forward_port);
+        } else {
+            Print(CYAN, "[TCP] 转发端口已设置为: ", *config.tcp_forward_port);
         }
 
-        // 阶段二: 切换到 KeepAliveHost 维持端口
-        Print(CYAN, "[TCP] 维持: 正在连接保活服务器 ", *config.keep_alive_host, ":80...");
-        keep_alive_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        // 阶段二: 创建监听 Socket
         listener_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-
         BOOL reuse = TRUE;
-        setsockopt(keep_alive_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
         setsockopt(listener_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
         sockaddr_in local_addr = { AF_INET, htons(*config.tcp_listen_port), {INADDR_ANY} };
 
-        if (bind(keep_alive_sock, (sockaddr*)&local_addr, sizeof(local_addr)) != 0 ||
-            bind(listener_sock, (sockaddr*)&local_addr, sizeof(local_addr)) != 0 ||
+        if (bind(listener_sock, (sockaddr*)&local_addr, sizeof(local_addr)) != 0 ||
             listen(listener_sock, SOMAXCONN) != 0) {
-            Print(RED, "[TCP] 维持: 绑定本地端口失败 重启流程...");
-            closesocket(keep_alive_sock); closesocket(listener_sock);
-            if (config.auto_retry) std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms));
-            continue;
-        }
-
-        addrinfo* ka_res = nullptr;
-        bool ka_connected = false;
-        
-        for (int retry_count = 0; retry_count < config.keep_alive_retry; ++retry_count) {
-            if (getaddrinfo(config.keep_alive_host->c_str(), "80", nullptr, &ka_res) == 0) {
-                if (connect(keep_alive_sock, ka_res->ai_addr, (int)ka_res->ai_addrlen) == 0) {
-                    ka_connected = true;
-                    freeaddrinfo(ka_res);
-                    break; 
-                }
-                freeaddrinfo(ka_res);
-            }
-            
-            if (retry_count < config.keep_alive_retry - 1) {
-                Print(YELLOW, "[TCP] 维持: 连接保活服务器失败 3秒后重试 (", retry_count + 1, "/", config.keep_alive_retry, ")...");
-                std::this_thread::sleep_for(std::chrono::seconds(3));
-            }
-        }
-
-        if (!ka_connected) {
-            Print(RED, "[TCP] 维持: 连接保活服务器失败 所有重试均告失败 重启流程...");
-            closesocket(keep_alive_sock); closesocket(listener_sock);
+            Print(RED, "[TCP] 维持: 绑定或监听本地端口失败 重启流程...");
+            if(listener_sock != INVALID_SOCKET) closesocket(listener_sock);
             if (config.auto_retry) std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms));
             continue;
         }
         
-        Print(LIGHT_GREEN, "[TCP] 维持: 成功连接保活服务器 端口已开启并监听");
+        Print(LIGHT_GREEN, "[TCP] 维持: 本地端口监听已就绪");
         g_tcp_ready = true;
         
         while (!CheckAndExecuteRun(base_config, base_config.tcp_listen_port.has_value(), base_config.udp_listen_port.has_value())) {
-            if (g_tcp_reconnect_flag || g_udp_reconnect_flag) break;
+            if (g_tcp_reconnect_flag) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         
         std::thread(TCP_StunCheckThread, public_ip, public_port, config, *config.tcp_listen_port).detach();
 
-        TCP_SingleThreadProxyLoop(listener_sock, keep_alive_sock, config);
+        // 将控制权交给代理循环 它将独立处理“软”恢复
+        TCP_SingleThreadProxyLoop(listener_sock, config, *config.tcp_listen_port);
 
+        // 只有在代理循环因为“硬”恢复信号退出后 才会执行到这里
         closesocket(listener_sock);
-        closesocket(keep_alive_sock);
         if (g_tcp_reconnect_flag) {
-            Print(YELLOW, "[TCP] 检测到重连信号 重启流程...");
+            Print(YELLOW, "[TCP] 检测到公网地址变更 重启完整穿透流程...");
         }
     } while (base_config.auto_retry);
 
