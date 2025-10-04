@@ -35,6 +35,12 @@
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup")
 
 // 全局定义和辅助工具
+// 【新】用于存储连接对的数据结构
+struct ConnectionPair {
+    SOCKET client_socket; // 来自公网的连接
+    SOCKET local_socket;  // 连接到本地P2P软件的连接
+};
+
 std::atomic<bool> g_tcp_reconnect_flag{false};
 std::atomic<bool> g_udp_reconnect_flag{false};
 std::atomic<bool> g_tcp_ready{false};
@@ -445,7 +451,7 @@ void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
         std::this_thread::sleep_for(std::chrono::seconds(config.monitor_interval_sec));
         if (g_tcp_reconnect_flag) break;
 
-        // Print(CYAN, "\n[TCP] 监控: 正在检查公网地址...");
+        Print(CYAN, "\n[TCP] 监控: 正在检查公网地址...");
         
         bool overall_check_success = false;
         std::string current_ip; 
@@ -528,8 +534,138 @@ void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
     }
 }
 
-// 【改】TCP 模块 - 采用角色分离方案
-// 【修复】TCP 模块 - 修复保活逻辑
+// 【新】单线程代理循环 处理所有连接
+void TCP_SingleThreadProxyLoop(SOCKET listener_sock, SOCKET keep_alive_sock, const Config& config) {
+    std::map<SOCKET, ConnectionPair> connections;
+    char buffer[8192];
+
+    std::string ka_host = *config.keep_alive_host;
+    std::string keep_alive_packet = "HEAD / HTTP/1.1\r\nHost: " + ka_host + "\r\nConnection: keep-alive\r\n\r\n";
+    auto last_keepalive_time = std::chrono::steady_clock::now();
+
+    while (!g_tcp_reconnect_flag) {
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+
+        // 1. 将所有需要监视的socket加入fd_set
+        FD_SET(listener_sock, &read_fds);
+        FD_SET(keep_alive_sock, &read_fds);
+        SOCKET max_sd = max(listener_sock, keep_alive_sock);
+
+        for (const auto& pair : connections) {
+            FD_SET(pair.second.client_socket, &read_fds);
+            FD_SET(pair.second.local_socket, &read_fds);
+            max_sd = max(max_sd, pair.second.client_socket);
+            max_sd = max(max_sd, pair.second.local_socket);
+        }
+
+        timeval timeout;
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+
+        int activity = select(max_sd + 1, &read_fds, NULL, NULL, &timeout);
+
+        if (activity == SOCKET_ERROR) {
+            g_tcp_reconnect_flag = true;
+            break;
+        }
+
+        // 2. 处理事件
+        // 2.1 检查是否有新连接
+        if (FD_ISSET(listener_sock, &read_fds)) {
+            SOCKET new_client_socket = accept(listener_sock, NULL, NULL);
+            if (new_client_socket != INVALID_SOCKET) {
+                Print(GREEN, "[TCP] 新连接来自公网...");
+                if (config.tcp_forward_host && !config.tcp_forward_host->empty()) {
+                    SOCKET new_local_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                    addrinfo* fwd_res = nullptr;
+                    getaddrinfo(config.tcp_forward_host->c_str(), std::to_string(*config.tcp_forward_port).c_str(), nullptr, &fwd_res);
+                    if (connect(new_local_socket, fwd_res->ai_addr, (int)fwd_res->ai_addrlen) == 0) {
+                        Print(YELLOW, "[TCP] 成功创建转发通道");
+                        connections[new_client_socket] = { new_client_socket, new_local_socket };
+                        connections[new_local_socket] = { new_client_socket, new_local_socket };
+                    } else {
+                        Print(RED, "[TCP] 无法连接本地目标 关闭公网连接");
+                        closesocket(new_client_socket);
+                        closesocket(new_local_socket);
+                    }
+                    freeaddrinfo(fwd_res);
+                } else {
+                    Print(CYAN, "[TCP] 仅打洞模式 接受并立即关闭");
+                    closesocket(new_client_socket);
+                }
+            }
+        }
+
+        // 2.2 检查保活服务器的响应
+        if (FD_ISSET(keep_alive_sock, &read_fds)) {
+            int bytes = recv(keep_alive_sock, buffer, sizeof(buffer), 0);
+            if (bytes <= 0) {
+                Print(RED, "[TCP] 维持: 与保活服务器的连接已关闭");
+                g_tcp_reconnect_flag = true;
+                break;
+            }
+        }
+
+        // 2.3 检查所有现有连接的数据
+        for (auto it = connections.begin(); it != connections.end(); ) {
+            bool connection_closed = false;
+            SOCKET source_sock = it->first;
+            
+            if (FD_ISSET(source_sock, &read_fds)) {
+                SOCKET target_sock = (source_sock == it->second.client_socket) ? it->second.local_socket : it->second.client_socket;
+                int bytes = recv(source_sock, buffer, sizeof(buffer), 0);
+                if (bytes > 0) {
+                    if (send(target_sock, buffer, bytes, 0) <= 0) {
+                        connection_closed = true;
+                    }
+                } else {
+                    connection_closed = true;
+                }
+            }
+
+            if (connection_closed) {
+                Print(YELLOW, "[TCP] 连接关闭 清理通道");
+                closesocket(it->second.client_socket);
+                closesocket(it->second.local_socket);
+                // 从map中安全地删除两个相关的条目
+                SOCKET s1 = it->second.client_socket;
+                SOCKET s2 = it->second.local_socket;
+                connections.erase(s1);
+                it = connections.find(s2); // 重新定位迭代器
+                if (it != connections.end()) {
+                    it = connections.erase(it);
+                } else {
+                    // 如果s2已经被删除（例如s1==s2的罕见情况） 则需要重新开始循环
+                    it = connections.begin();
+                }
+            } else {
+                ++it;
+            }
+        }
+
+        // 3. 发送保活包
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_keepalive_time).count() > config.keep_alive_ms) {
+            if (send(keep_alive_sock, keep_alive_packet.c_str(), keep_alive_packet.length(), 0) == SOCKET_ERROR) {
+                Print(RED, "[TCP] 维持: 发送保活包失败");
+                g_tcp_reconnect_flag = true;
+                break;
+            }
+            last_keepalive_time = now;
+        }
+    }
+
+    // 清理所有剩余的连接
+    for (auto const& [key, val] : connections) {
+        // 只需要关闭一次 因为map中有重复的socket值
+        if (key == val.client_socket) {
+            closesocket(val.client_socket);
+            closesocket(val.local_socket);
+        }
+    }
+}
+
 void TCP_PortForwardingThread(Config base_config) {
     winrt::init_apartment();
 
@@ -548,9 +684,10 @@ void TCP_PortForwardingThread(Config base_config) {
         std::string public_ip; int public_port;
         bool stun_success = false;
 
-        Print(WHITE, "\n--- [TCP] 开始新一轮端口穿透尝试 ---");
+        Print(WHITE, "\n--- [TCP] 开始新一轮端口开启尝试 ---");
 
-        // 阶段一: 使用 STUN 服务器发现端口
+        // 阶段一: 发现端口 (这部分逻辑保持不变)
+        // ... (省略与之前版本相同的STUN发现代码) ...
         for (const auto& server_str : config.stun_servers) {
             if (stun_success) break;
             size_t colon_pos = server_str.find(':');
@@ -590,6 +727,7 @@ void TCP_PortForwardingThread(Config base_config) {
             }
         }
 
+
         if (!stun_success) {
             Print(RED, "[TCP] 发现: 所有STUN服务器均尝试失败");
             if (config.auto_retry) {
@@ -604,10 +742,11 @@ void TCP_PortForwardingThread(Config base_config) {
         g_tcp_port_str = std::to_string(public_port);
         if (config.tcp_forward_port == 0) {
             config.tcp_forward_port = public_port;
-            Print(CYAN, "[TCP] 转发端口已设置为公网端口: ", *config.tcp_forward_port);
+            Print(CYAN, "[TCP] 动态转发端口已设置为公网端口: ", *config.tcp_forward_port);
         }
 
-        // 阶段二: 切换到 KeepAliveHost 维持端口
+        // 阶段二: 维持端口 (这部分逻辑也保持不变)
+        // ... (省略与之前版本相同的连接保活服务器的代码) ...
         Print(CYAN, "[TCP] 维持: 正在连接保活服务器 ", *config.keep_alive_host, ":80...");
         keep_alive_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         listener_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -635,6 +774,7 @@ void TCP_PortForwardingThread(Config base_config) {
             freeaddrinfo(ka_res);
         }
 
+
         if (!ka_connected) {
             Print(RED, "[TCP] 维持: 连接保活服务器失败 重启流程...");
             closesocket(keep_alive_sock); closesocket(listener_sock);
@@ -651,61 +791,12 @@ void TCP_PortForwardingThread(Config base_config) {
         
         std::thread(TCP_StunCheckThread, public_ip, public_port, config, *config.tcp_listen_port).detach();
 
-        auto last_keepalive_time = std::chrono::steady_clock::now();
-        std::string ka_host = *config.keep_alive_host;
-        std::string keep_alive_packet = "HEAD / HTTP/1.1\r\nHost: " + ka_host + "\r\nConnection: keep-alive\r\n\r\n";
+        // 【改】调用新的单线程代理循环 而不是自己处理
+        TCP_SingleThreadProxyLoop(listener_sock, keep_alive_sock, config);
 
-        while (!g_tcp_reconnect_flag) {
-            fd_set read_fds; 
-            FD_ZERO(&read_fds); 
-            FD_SET(listener_sock, &read_fds);
-            FD_SET(keep_alive_sock, &read_fds); // 【新】同时监听保活Socket上的响应数据
-
-            SOCKET max_sd = max(listener_sock, keep_alive_sock);
-
-            timeval timeout; timeout.tv_sec = 1; timeout.tv_usec = 0;
-            int activity = select(max_sd + 1, &read_fds, NULL, NULL, &timeout);
-
-            if (activity == SOCKET_ERROR) { g_tcp_reconnect_flag = true; break; }
-            
-            if (activity > 0) {
-                // 检查是否有新客户端连接
-                if (FD_ISSET(listener_sock, &read_fds)) {
-                    SOCKET peer_sock = accept(listener_sock, NULL, NULL);
-                    if (peer_sock != INVALID_SOCKET) {
-                        if (config.tcp_forward_host && !config.tcp_forward_host->empty()) {
-                            std::thread(TCP_HandleNewConnection, peer_sock, config).detach();
-                        } else {
-                            Print(CYAN, "[TCP] 接受连接并立即关闭 (仅打洞模式)");
-                            closesocket(peer_sock);
-                        }
-                    }
-                }
-
-                // 【新】检查保活服务器是否发回了响应数据
-                if (FD_ISSET(keep_alive_sock, &read_fds)) {
-                    char discard_buffer[4096];
-                    int bytes = recv(keep_alive_sock, discard_buffer, sizeof(discard_buffer), 0);
-                    if (bytes <= 0) { // 如果recv返回0或-1 说明连接已由服务器关闭
-                        Print(RED, "[TCP] 维持: 与保活服务器的连接已由对方关闭");
-                        g_tcp_reconnect_flag = true;
-                        break;
-                    }
-                    // 成功读取并丢弃数据 什么都不用做
-                }
-            }
-
-            auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_keepalive_time).count() > config.keep_alive_ms) {
-                if (send(keep_alive_sock, keep_alive_packet.c_str(), keep_alive_packet.length(), 0) == SOCKET_ERROR) {
-                    Print(RED, "[TCP] 维持: 发送保活包失败 连接可能已断开");
-                    g_tcp_reconnect_flag = true;
-                    break;
-                }
-                last_keepalive_time = now;
-            }
-        }
-        closesocket(listener_sock); closesocket(keep_alive_sock);
+        // 循环结束后 清理工作
+        closesocket(listener_sock);
+        closesocket(keep_alive_sock);
         if (g_tcp_reconnect_flag) {
             Print(YELLOW, "[TCP] 检测到重连信号 重启流程...");
         }
