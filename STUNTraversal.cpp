@@ -1003,6 +1003,7 @@ void MainLogic(const Config& config) {
     Print(YELLOW, "--- STUN Traversal ---");
 	Print(YELLOW, "--- 隐藏运行 -hide ---");
 	Print(YELLOW, "--- 显示通知 -show ---");
+	Print(YELLOW, "--- 运行程序 -run ---");
     if (config.stun_servers.empty()) {
         Print(RED, "错误：配置文件中未找到任何 [STUN] 服务器");
         return;
