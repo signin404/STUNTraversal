@@ -34,10 +34,7 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup")
 
-// =================================================================================
 // 全局定义和辅助工具
-// =================================================================================
-
 std::atomic<bool> g_tcp_reconnect_flag{false};
 std::atomic<bool> g_udp_reconnect_flag{false};
 std::atomic<bool> g_tcp_ready{false};
@@ -102,10 +99,7 @@ std::wstring StringToWstring(const std::string& str) {
     return wstrTo;
 }
 
-// =================================================================================
 // 配置管理
-// =================================================================================
-
 struct Config {
     std::vector<std::string> stun_servers;
     std::optional<int> tcp_listen_port;
@@ -440,9 +434,11 @@ void TCP_HandleNewConnection(SOCKET peer_sock, Config config) {
     freeaddrinfo(fwd_res);
 }
 
+// 【修改】TCP 监控线程 - 采用新的、更稳健的重连逻辑
 void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config& config, int local_port) {
     while (!g_tcp_reconnect_flag) {
-        std::this_thread::sleep_for(std::chrono::minutes(5));
+        // 【改】使用 KeepAliveMS 作为检测间隔
+        std::this_thread::sleep_for(std::chrono::milliseconds(config.keep_alive_ms));
         if (g_tcp_reconnect_flag) break;
 
         Print(CYAN, "\n[TCP] 监控: 正在检查公网地址...");
@@ -451,13 +447,15 @@ void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
         std::string current_ip; 
         int current_port;
 
+        // 遍历所有 STUN 服务器进行检查 直到有一个成功为止
         for (const auto& server_str : config.stun_servers) {
             size_t colon_pos = server_str.find(':');
             if (colon_pos == std::string::npos) continue;
             std::string host = server_str.substr(0, colon_pos);
             int port = std::stoi(server_str.substr(colon_pos + 1));
             
-            Print(CYAN, "[TCP] 监控: 尝试 STUN 服务器 ", host, ":", port);
+            // 不再打印每次尝试的日志 避免刷屏 只在最终失败时打印
+            // Print(CYAN, "[TCP] 监控: 尝试 STUN 服务器 ", host, ":", port);
 
             SOCKET check_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (check_sock == INVALID_SOCKET) continue;
@@ -473,7 +471,23 @@ void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
 
             addrinfo* stun_res = nullptr;
             if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), nullptr, &stun_res) == 0) {
-                if (connect(check_sock, stun_res->ai_addr, (int)stun_res->ai_addrlen) == 0) {
+                // 为 connect 操作设置一个较短的超时 避免长时间阻塞
+                unsigned long non_blocking = 1;
+                ioctlsocket(check_sock, FIONBIO, &non_blocking);
+                
+                connect(check_sock, stun_res->ai_addr, (int)stun_res->ai_addrlen);
+
+                fd_set write_fds;
+                FD_ZERO(&write_fds);
+                FD_SET(check_sock, &write_fds);
+                timeval timeout;
+                timeout.tv_sec = 3; // 3秒连接超时
+                timeout.tv_usec = 0;
+
+                if (select(0, NULL, &write_fds, NULL, &timeout) > 0) {
+                    unsigned long blocking = 0;
+                    ioctlsocket(check_sock, FIONBIO, &blocking);
+
                     char req[20];
                     BuildStunRequest(req, StunRfc::RFC5780);
                     if (send(check_sock, req, sizeof(req), 0) != SOCKET_ERROR) {
@@ -491,31 +505,31 @@ void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
             closesocket(check_sock);
 
             if (overall_check_success) {
-                break;
+                break; // 检查成功 无需尝试下一个服务器
             }
         }
 
+        // 【改】核心逻辑修改
         if (overall_check_success) {
+            // 只有在检查成功时 才进行比较
             if (current_ip != initial_ip || current_port != initial_port) {
                 Print(YELLOW, "[TCP] 监控: 公网地址已变更！");
                 Print(YELLOW, "       旧: ", initial_ip, ":", initial_port, " -> 新: ", current_ip, ":", current_port);
-                g_tcp_reconnect_flag = true;
+                g_tcp_reconnect_flag = true; // 触发重连
             } else {
                 Print(GREEN, "[TCP] 监控: 公网地址未变更");
             }
         } else {
+            // 如果所有 STUN 服务器都检查失败 则什么都不做
             Print(RED, "[TCP] 监控: 所有 STUN 服务器检查均失败");
-            g_tcp_reconnect_flag = true;
+            Print(YELLOW, "[TCP] 监控: 将维持当前连接 稍后重试...");
+            // 此处不再设置 g_tcp_reconnect_flag = true;
         }
     }
 }
 
-// =================================================================================
 // 【改】TCP 模块 - 采用角色分离方案
-// =================================================================================
-// =================================================================================
 // 【修复】TCP 模块 - 修复保活逻辑
-// =================================================================================
 void TCP_PortForwardingThread(Config base_config) {
     winrt::init_apartment();
 
@@ -699,7 +713,6 @@ void TCP_PortForwardingThread(Config base_config) {
 
     winrt::uninit_apartment();
 }
-
 
 // ... (UDP 模块和主入口点模块保持不变) ...
 struct UDPSession {
