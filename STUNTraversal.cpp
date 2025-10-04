@@ -547,7 +547,6 @@ void TCP_SingleThreadProxyLoop(SOCKET listener_sock, SOCKET keep_alive_sock, con
         fd_set read_fds;
         FD_ZERO(&read_fds);
 
-        // 1. 将所有需要监视的socket加入fd_set
         FD_SET(listener_sock, &read_fds);
         FD_SET(keep_alive_sock, &read_fds);
         SOCKET max_sd = max(listener_sock, keep_alive_sock);
@@ -570,12 +569,19 @@ void TCP_SingleThreadProxyLoop(SOCKET listener_sock, SOCKET keep_alive_sock, con
             break;
         }
 
-        // 2. 处理事件
-        // 2.1 检查是否有新连接
         if (FD_ISSET(listener_sock, &read_fds)) {
-            SOCKET new_client_socket = accept(listener_sock, NULL, NULL);
+            // 【改】准备接收客户端地址信息的变量
+            sockaddr_in client_addr;
+            int client_addr_len = sizeof(client_addr);
+            SOCKET new_client_socket = accept(listener_sock, (sockaddr*)&client_addr, &client_addr_len);
+
             if (new_client_socket != INVALID_SOCKET) {
-                Print(GREEN, "[TCP] 新连接来自公网...");
+                // 【改】将地址信息转换为字符串并打印
+                char client_ip_str[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &client_addr.sin_addr, client_ip_str, sizeof(client_ip_str));
+                int client_port = ntohs(client_addr.sin_port);
+                Print(GREEN, "[TCP] 新连接来自 ", client_ip_str, ":", client_port);
+
                 if (config.tcp_forward_host && !config.tcp_forward_host->empty()) {
                     SOCKET new_local_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                     addrinfo* fwd_res = nullptr;
@@ -597,7 +603,6 @@ void TCP_SingleThreadProxyLoop(SOCKET listener_sock, SOCKET keep_alive_sock, con
             }
         }
 
-        // 2.2 检查保活服务器的响应
         if (FD_ISSET(keep_alive_sock, &read_fds)) {
             int bytes = recv(keep_alive_sock, buffer, sizeof(buffer), 0);
             if (bytes <= 0) {
@@ -607,7 +612,6 @@ void TCP_SingleThreadProxyLoop(SOCKET listener_sock, SOCKET keep_alive_sock, con
             }
         }
 
-        // 2.3 检查所有现有连接的数据
         for (auto it = connections.begin(); it != connections.end(); ) {
             bool connection_closed = false;
             SOCKET source_sock = it->first;
@@ -628,15 +632,13 @@ void TCP_SingleThreadProxyLoop(SOCKET listener_sock, SOCKET keep_alive_sock, con
                 Print(YELLOW, "[TCP] 连接关闭 清理通道");
                 closesocket(it->second.client_socket);
                 closesocket(it->second.local_socket);
-                // 从map中安全地删除两个相关的条目
                 SOCKET s1 = it->second.client_socket;
                 SOCKET s2 = it->second.local_socket;
                 connections.erase(s1);
-                it = connections.find(s2); // 重新定位迭代器
+                it = connections.find(s2);
                 if (it != connections.end()) {
                     it = connections.erase(it);
                 } else {
-                    // 如果s2已经被删除（例如s1==s2的罕见情况） 则需要重新开始循环
                     it = connections.begin();
                 }
             } else {
@@ -644,7 +646,6 @@ void TCP_SingleThreadProxyLoop(SOCKET listener_sock, SOCKET keep_alive_sock, con
             }
         }
 
-        // 3. 发送保活包
         auto now = std::chrono::steady_clock::now();
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_keepalive_time).count() > config.keep_alive_ms) {
             if (send(keep_alive_sock, keep_alive_packet.c_str(), keep_alive_packet.length(), 0) == SOCKET_ERROR) {
@@ -656,9 +657,7 @@ void TCP_SingleThreadProxyLoop(SOCKET listener_sock, SOCKET keep_alive_sock, con
         }
     }
 
-    // 清理所有剩余的连接
     for (auto const& [key, val] : connections) {
-        // 只需要关闭一次 因为map中有重复的socket值
         if (key == val.client_socket) {
             closesocket(val.client_socket);
             closesocket(val.local_socket);
