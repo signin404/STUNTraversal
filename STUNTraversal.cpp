@@ -570,34 +570,32 @@ void TCP_SingleThreadProxyLoop(SOCKET listener_sock, SOCKET keep_alive_sock, con
         }
 
         if (FD_ISSET(listener_sock, &read_fds)) {
-            // 【改】准备接收客户端地址信息的变量
             sockaddr_in client_addr;
             int client_addr_len = sizeof(client_addr);
             SOCKET new_client_socket = accept(listener_sock, (sockaddr*)&client_addr, &client_addr_len);
 
             if (new_client_socket != INVALID_SOCKET) {
-                // 【改】将地址信息转换为字符串并打印
                 char client_ip_str[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &client_addr.sin_addr, client_ip_str, sizeof(client_ip_str));
                 int client_port = ntohs(client_addr.sin_port);
-                Print(GREEN, "[TCP] 新连接来自 ", client_ip_str, ":", client_port);
 
                 if (config.tcp_forward_host && !config.tcp_forward_host->empty()) {
                     SOCKET new_local_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                     addrinfo* fwd_res = nullptr;
                     getaddrinfo(config.tcp_forward_host->c_str(), std::to_string(*config.tcp_forward_port).c_str(), nullptr, &fwd_res);
                     if (connect(new_local_socket, fwd_res->ai_addr, (int)fwd_res->ai_addrlen) == 0) {
-                        Print(YELLOW, "[TCP] 成功创建转发通道");
+                        // 【改】合并日志语句 并恢复为旧格式
+                        Print(YELLOW, "[TCP] 开始转发 ", client_ip_str, " <==> ", *config.tcp_forward_host, ":", *config.tcp_forward_port);
                         connections[new_client_socket] = { new_client_socket, new_local_socket };
                         connections[new_local_socket] = { new_client_socket, new_local_socket };
                     } else {
-                        Print(RED, "[TCP] 无法连接本地目标 关闭公网连接");
+                        Print(RED, "[TCP] 无法连接本地目标 来自 ", client_ip_str, ":", client_port, " 的连接已关闭");
                         closesocket(new_client_socket);
                         closesocket(new_local_socket);
                     }
                     freeaddrinfo(fwd_res);
                 } else {
-                    Print(CYAN, "[TCP] 仅打洞模式 接受并立即关闭");
+                    Print(CYAN, "[TCP] 仅打洞模式 来自 ", client_ip_str, ":", client_port, " 的连接已接受并立即关闭");
                     closesocket(new_client_socket);
                 }
             }
@@ -629,7 +627,7 @@ void TCP_SingleThreadProxyLoop(SOCKET listener_sock, SOCKET keep_alive_sock, con
             }
 
             if (connection_closed) {
-                Print(YELLOW, "[TCP] 连接关闭 清理通道");
+                // Print(YELLOW, "[TCP] 连接关闭 清理通道");
                 closesocket(it->second.client_socket);
                 closesocket(it->second.local_socket);
                 SOCKET s1 = it->second.client_socket;
