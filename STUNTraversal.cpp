@@ -118,7 +118,9 @@ struct Config {
     int udp_max_chunk_length = 1500;
     std::optional<std::string> run_path;
     std::optional<std::string> run_cmd;
-    std::optional<std::string> keep_alive_host; // 【新】保活服务器设置
+    std::optional<std::string> keep_alive_host;
+    // 【改】变量名和单位已更新为秒
+    int monitor_interval_sec = 300; 
 };
 
 Config ReadIniConfig(const std::wstring& filePath) {
@@ -189,7 +191,9 @@ Config ReadIniConfig(const std::wstring& filePath) {
                     else if (key_w == L"udpmaxchunklength") config.udp_max_chunk_length = std::stoi(value);
                     else if (key_w == L"run") config.run_path = value;
                     else if (key_w == L"runcmd") config.run_cmd = value;
-                    else if (key_w == L"keepalivehost") config.keep_alive_host = value; // 【新】读取保活服务器
+                    else if (key_w == L"keepalivehost") config.keep_alive_host = value;
+                    // 【改】读取新的配置项 monitorintervalsec
+                    else if (key_w == L"monitorintervalsec") config.monitor_interval_sec = std::stoi(value);
                 } catch (const std::exception&) { /* ignore bad values */ }
             }
         }
@@ -437,8 +441,8 @@ void TCP_HandleNewConnection(SOCKET peer_sock, Config config) {
 // 【修改】TCP 监控线程 - 采用新的、更稳健的重连逻辑
 void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config& config, int local_port) {
     while (!g_tcp_reconnect_flag) {
-        // 【改】使用 KeepAliveMS 作为检测间隔
-        std::this_thread::sleep_for(std::chrono::milliseconds(config.keep_alive_ms));
+        // 【改】使用新的 monitor_interval_sec 和 std::chrono::seconds
+        std::this_thread::sleep_for(std::chrono::seconds(config.monitor_interval_sec));
         if (g_tcp_reconnect_flag) break;
 
         // Print(CYAN, "\n[TCP] 监控: 正在检查公网地址...");
@@ -449,6 +453,8 @@ void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
 
         // 遍历所有 STUN 服务器进行检查 直到有一个成功为止
         for (const auto& server_str : config.stun_servers) {
+            if (overall_check_success) break;
+
             size_t colon_pos = server_str.find(':');
             if (colon_pos == std::string::npos) continue;
             std::string host = server_str.substr(0, colon_pos);
@@ -503,10 +509,6 @@ void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
                 freeaddrinfo(stun_res);
             }
             closesocket(check_sock);
-
-            if (overall_check_success) {
-                break; // 检查成功 无需尝试下一个服务器
-            }
         }
 
         // 【改】核心逻辑修改
@@ -516,8 +518,6 @@ void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
                 Print(YELLOW, "[TCP] 监控: 公网地址已变更！");
                 Print(YELLOW, "       旧: ", initial_ip, ":", initial_port, " -> 新: ", current_ip, ":", current_port);
                 g_tcp_reconnect_flag = true; // 触发重连
-            } else {
-                // Print(GREEN, "[TCP] 监控: 公网地址未变更");
             }
         } else {
             // 如果所有 STUN 服务器都检查失败 则什么都不做
