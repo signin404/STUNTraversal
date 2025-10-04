@@ -441,7 +441,7 @@ void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
         std::this_thread::sleep_for(std::chrono::milliseconds(config.keep_alive_ms));
         if (g_tcp_reconnect_flag) break;
 
-        Print(CYAN, "\n[TCP] 监控: 正在检查公网地址...");
+        // Print(CYAN, "\n[TCP] 监控: 正在检查公网地址...");
         
         bool overall_check_success = false;
         std::string current_ip; 
@@ -517,7 +517,7 @@ void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
                 Print(YELLOW, "       旧: ", initial_ip, ":", initial_port, " -> 新: ", current_ip, ":", current_port);
                 g_tcp_reconnect_flag = true; // 触发重连
             } else {
-                Print(GREEN, "[TCP] 监控: 公网地址未变更");
+                // Print(GREEN, "[TCP] 监控: 公网地址未变更");
             }
         } else {
             // 如果所有 STUN 服务器都检查失败 则什么都不做
