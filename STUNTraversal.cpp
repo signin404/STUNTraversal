@@ -506,17 +506,14 @@ void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
 
             if (protocol_map.count(server_str)) {
                 StunRfc known_rfc = protocol_map.at(server_str);
-                Print(CYAN, "[TCP] 监控: 尝试 ", host, " (已知协议 RFC", (known_rfc == StunRfc::RFC5780 ? "5780" : "3489"), ")");
                 if (attempt_protocol(known_rfc)) {
                     overall_check_success = true;
                 }
             } else {
-                Print(CYAN, "[TCP] 监控: 尝试 ", host, " (RFC5780)");
                 if (attempt_protocol(StunRfc::RFC5780)) {
                     overall_check_success = true;
                     protocol_map[server_str] = StunRfc::RFC5780;
                 } else {
-                    Print(CYAN, "[TCP] 监控: 尝试 ", host, " (RFC3489)");
                     if (attempt_protocol(StunRfc::RFC3489)) {
                         overall_check_success = true;
                         protocol_map[server_str] = StunRfc::RFC3489;
@@ -864,7 +861,7 @@ struct UDPSession {
     std::chrono::steady_clock::time_point last_activity;
 };
 
-// 【新】UDP 监控线程 - 实现与 TCP 相同的智能监控逻辑
+// 【修复】UDP 监控线程 - 添加 SO_REUSEADDR 并清理日志
 void UDP_StunCheckThread(std::string initial_ip, int initial_port, const Config& config, int local_port,
                          int initial_server_index, std::map<std::string, StunRfc> initial_protocol_map) {
 
@@ -893,8 +890,16 @@ void UDP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
             auto attempt_protocol = [&](StunRfc rfc) -> bool {
                 SOCKET check_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
                 if (check_sock == INVALID_SOCKET) return false;
+
+                // 【新】确保监控线程的Socket也设置了REUSEADDR
+                BOOL reuse = TRUE;
+                setsockopt(check_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+
                 sockaddr_in local_addr = { AF_INET, htons(local_port), {INADDR_ANY} };
-                if (bind(check_sock, (sockaddr*)&local_addr, sizeof(local_addr)) != 0) { closesocket(check_sock); return false; }
+                if (bind(check_sock, (sockaddr*)&local_addr, sizeof(local_addr)) != 0) { 
+                    closesocket(check_sock); 
+                    return false; 
+                }
 
                 bool success = false;
                 addrinfo* stun_res = nullptr;
@@ -918,17 +923,14 @@ void UDP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
 
             if (protocol_map.count(server_str)) {
                 StunRfc known_rfc = protocol_map.at(server_str);
-                Print(CYAN, "[UDP] 监控: 尝试 ", host, " (已知协议 RFC", (known_rfc == StunRfc::RFC5780 ? "5780" : "3489"), ")");
                 if (attempt_protocol(known_rfc)) {
                     overall_check_success = true;
                 }
             } else {
-                Print(CYAN, "[UDP] 监控: 尝试 ", host, " (RFC5780)");
                 if (attempt_protocol(StunRfc::RFC5780)) {
                     overall_check_success = true;
                     protocol_map[server_str] = StunRfc::RFC5780;
                 } else {
-                    Print(CYAN, "[UDP] 监控: 尝试 ", host, " (RFC3489)");
                     if (attempt_protocol(StunRfc::RFC3489)) {
                         overall_check_success = true;
                         protocol_map[server_str] = StunRfc::RFC3489;
@@ -955,7 +957,7 @@ void UDP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
     }
 }
 
-// 【重构】UDP 主线程 - 实现与 TCP 相同的智能穿透和监控启动
+// 【修复】UDP 主线程 - 为主Socket添加 SO_REUSEADDR
 void UDP_PortForwardingThread(Config base_config) {
     winrt::init_apartment();
 
@@ -979,6 +981,11 @@ void UDP_PortForwardingThread(Config base_config) {
         if(public_sock == INVALID_SOCKET) {
             if (config.auto_retry) { std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms)); continue; } else break;
         }
+
+        // 【新】为主 public_sock 添加 SO_REUSEADDR 选项，允许端口共享
+        BOOL reuse = TRUE;
+        setsockopt(public_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+
         sockaddr_in local_addr = { AF_INET, htons(*config.udp_listen_port), {INADDR_ANY} };
         if (bind(public_sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR) {
             closesocket(public_sock);
@@ -1054,14 +1061,12 @@ void UDP_PortForwardingThread(Config base_config) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
-        // 【新】启动 UDP 的后台监控线程
         std::thread(UDP_StunCheckThread, public_ip, public_port, config, *config.udp_listen_port, last_successful_server_index, protocol_map).detach();
 
         auto last_cleanup_time = std::chrono::steady_clock::now();
         auto last_keepalive_time = std::chrono::steady_clock::now();
 
         while (!g_udp_reconnect_flag) {
-            // ... (UDP 主循环的 select 和数据转发逻辑保持不变) ...
             fd_set read_fds; FD_ZERO(&read_fds);
             FD_SET(public_sock, &read_fds);
             SOCKET max_sd = public_sock;
