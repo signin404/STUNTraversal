@@ -506,17 +506,14 @@ void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
 
             if (protocol_map.count(server_str)) {
                 StunRfc known_rfc = protocol_map.at(server_str);
-                Print(CYAN, "[TCP] 监控: 尝试 ", host, " (已知协议 RFC", (known_rfc == StunRfc::RFC5780 ? "5780" : "3489"), ")");
                 if (attempt_protocol(known_rfc)) {
                     overall_check_success = true;
                 }
             } else {
-                Print(CYAN, "[TCP] 监控: 尝试 ", host, " (RFC5780)");
                 if (attempt_protocol(StunRfc::RFC5780)) {
                     overall_check_success = true;
                     protocol_map[server_str] = StunRfc::RFC5780;
                 } else {
-                    Print(CYAN, "[TCP] 监控: 尝试 ", host, " (RFC3489)");
                     if (attempt_protocol(StunRfc::RFC3489)) {
                         overall_check_success = true;
                         protocol_map[server_str] = StunRfc::RFC3489;
@@ -657,7 +654,7 @@ void TCP_SingleThreadProxyLoop(SOCKET listener_sock, const Config& config, int l
             }
         }
 
-        // 【新】使用“先标记，后删除”策略
+        // 【新】使用“先标记 后删除”策略
         std::vector<SOCKET> sockets_to_close;
         for (const auto& pair : connections) {
             SOCKET source_sock = pair.first;
@@ -864,98 +861,7 @@ struct UDPSession {
     std::chrono::steady_clock::time_point last_activity;
 };
 
-// 【新】UDP 监控线程 - 实现与 TCP 相同的智能监控逻辑
-void UDP_StunCheckThread(std::string initial_ip, int initial_port, const Config& config, int local_port,
-                         int initial_server_index, std::map<std::string, StunRfc> initial_protocol_map) {
-
-    int current_server_index = initial_server_index;
-    auto protocol_map = initial_protocol_map;
-
-    while (!g_udp_reconnect_flag) {
-        std::this_thread::sleep_for(std::chrono::seconds(config.monitor_interval_sec));
-        if (g_udp_reconnect_flag) break;
-
-        Print(CYAN, "\n[UDP] 监控: 正在检查公网地址...");
-
-        bool overall_check_success = false;
-        std::string current_ip;
-        int current_port;
-
-        for (int i = 0; i < config.stun_servers.size(); ++i) {
-            int server_index_to_try = (current_server_index + i) % config.stun_servers.size();
-            const auto& server_str = config.stun_servers[server_index_to_try];
-
-            size_t colon_pos = server_str.find(':');
-            if (colon_pos == std::string::npos) continue;
-            std::string host = server_str.substr(0, colon_pos);
-            int port = std::stoi(server_str.substr(colon_pos + 1));
-
-            auto attempt_protocol = [&](StunRfc rfc) -> bool {
-                SOCKET check_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-                if (check_sock == INVALID_SOCKET) return false;
-                sockaddr_in local_addr = { AF_INET, htons(local_port), {INADDR_ANY} };
-                if (bind(check_sock, (sockaddr*)&local_addr, sizeof(local_addr)) != 0) { closesocket(check_sock); return false; }
-
-                bool success = false;
-                addrinfo* stun_res = nullptr;
-                if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), nullptr, &stun_res) == 0) {
-                    char req[20]; BuildStunRequest(req, rfc);
-                    sendto(check_sock, req, sizeof(req), 0, stun_res->ai_addr, (int)stun_res->ai_addrlen);
-                    
-                    char response_buffer[512];
-                    sockaddr_in from_addr; int from_len = sizeof(from_addr);
-                    setsockopt(check_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&config.punch_timeout_ms, sizeof(config.punch_timeout_ms));
-                    int bytes = recvfrom(check_sock, response_buffer, sizeof(response_buffer), 0, (sockaddr*)&from_addr, &from_len);
-
-                    if (bytes > 20 && ParseStunResponse(response_buffer, bytes, rfc, current_ip, current_port)) {
-                        success = true;
-                    }
-                    freeaddrinfo(stun_res);
-                }
-                closesocket(check_sock);
-                return success;
-            };
-
-            if (protocol_map.count(server_str)) {
-                StunRfc known_rfc = protocol_map.at(server_str);
-                Print(CYAN, "[UDP] 监控: 尝试 ", host, " (已知协议 RFC", (known_rfc == StunRfc::RFC5780 ? "5780" : "3489"), ")");
-                if (attempt_protocol(known_rfc)) {
-                    overall_check_success = true;
-                }
-            } else {
-                Print(CYAN, "[UDP] 监控: 尝试 ", host, " (RFC5780)");
-                if (attempt_protocol(StunRfc::RFC5780)) {
-                    overall_check_success = true;
-                    protocol_map[server_str] = StunRfc::RFC5780;
-                } else {
-                    Print(CYAN, "[UDP] 监控: 尝试 ", host, " (RFC3489)");
-                    if (attempt_protocol(StunRfc::RFC3489)) {
-                        overall_check_success = true;
-                        protocol_map[server_str] = StunRfc::RFC3489;
-                    }
-                }
-            }
-
-            if (overall_check_success) {
-                current_server_index = server_index_to_try;
-                break;
-            }
-        }
-
-        if (overall_check_success) {
-            if (current_ip != initial_ip || current_port != initial_port) {
-                Print(YELLOW, "[UDP] 监控: 公网地址已变更！");
-                Print(YELLOW, "       旧: ", initial_ip, ":", initial_port, " -> 新: ", current_ip, ":", current_port);
-                g_udp_reconnect_flag = true;
-            }
-        } else {
-            Print(RED, "[UDP] 监控: 所有 STUN 服务器检查均失败");
-            Print(YELLOW, "[UDP] 监控: 将维持当前连接 稍后重试...");
-        }
-    }
-}
-
-// 【重构】UDP 主线程 - 实现与 TCP 相同的智能穿透和监控启动
+// 【完整最终版】UDP 主线程 - 集成监控功能 移除独立的监控线程
 void UDP_PortForwardingThread(Config base_config) {
     winrt::init_apartment();
 
@@ -968,10 +874,10 @@ void UDP_PortForwardingThread(Config base_config) {
         std::string public_ip; int public_port;
         bool stun_success = false;
         std::map<std::string, UDPSession> sessions;
-        sockaddr_in successful_stun_server_addr;
         
         int last_successful_server_index = -1;
         std::map<std::string, StunRfc> protocol_map;
+        sockaddr_in last_successful_stun_server_addr;
 
         Print(WHITE, "\n--- [UDP] 开始新一轮端口穿透尝试 ---");
 
@@ -979,6 +885,10 @@ void UDP_PortForwardingThread(Config base_config) {
         if(public_sock == INVALID_SOCKET) {
             if (config.auto_retry) { std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms)); continue; } else break;
         }
+
+        BOOL reuse = TRUE;
+        setsockopt(public_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+
         sockaddr_in local_addr = { AF_INET, htons(*config.udp_listen_port), {INADDR_ANY} };
         if (bind(public_sock, (sockaddr*)&local_addr, sizeof(local_addr)) == SOCKET_ERROR) {
             closesocket(public_sock);
@@ -1010,7 +920,7 @@ void UDP_PortForwardingThread(Config base_config) {
 
                         if (bytes > 20 && ParseStunResponse(response_buffer, bytes, rfc, public_ip, public_port)) {
                             stun_success = true;
-                            memcpy(&successful_stun_server_addr, stun_res->ai_addr, stun_res->ai_addrlen);
+                            memcpy(&last_successful_stun_server_addr, stun_res->ai_addr, stun_res->ai_addrlen);
                             last_successful_server_index = i;
                             protocol_map[server_str] = rfc;
                         }
@@ -1025,9 +935,13 @@ void UDP_PortForwardingThread(Config base_config) {
             if (stun_success) break;
             attempt_stun(StunRfc::RFC3489);
         }
+        
+        // 恢复socket为非阻塞/无超时模式 以配合select
+        int timeout_zero = 0;
+        setsockopt(public_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_zero, sizeof(timeout_zero));
 
         if (!stun_success) {
-            Print(RED, "[UDP] 发现: 所有STUN服务器均尝试失败");
+            Print(RED, "[UDP] 所有STUN服务器均尝试失败");
             closesocket(public_sock);
             if (config.auto_retry) {
                 Print(YELLOW, "[UDP] 等待 ", config.retry_interval_ms / 1000, " 秒后重试...");
@@ -1035,6 +949,10 @@ void UDP_PortForwardingThread(Config base_config) {
             }
             continue;
         }
+
+        // 记录初始公网地址 用于后续比较
+        std::string initial_public_ip = public_ip;
+        int initial_public_port = public_port;
 
         g_public_ip = public_ip;
         g_udp_port_str = std::to_string(public_port);
@@ -1054,14 +972,11 @@ void UDP_PortForwardingThread(Config base_config) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
-        // 【新】启动 UDP 的后台监控线程
-        std::thread(UDP_StunCheckThread, public_ip, public_port, config, *config.udp_listen_port, last_successful_server_index, protocol_map).detach();
-
         auto last_cleanup_time = std::chrono::steady_clock::now();
         auto last_keepalive_time = std::chrono::steady_clock::now();
+        auto last_monitor_time = std::chrono::steady_clock::now();
 
         while (!g_udp_reconnect_flag) {
-            // ... (UDP 主循环的 select 和数据转发逻辑保持不变) ...
             fd_set read_fds; FD_ZERO(&read_fds);
             FD_SET(public_sock, &read_fds);
             SOCKET max_sd = public_sock;
@@ -1071,7 +986,7 @@ void UDP_PortForwardingThread(Config base_config) {
                 if (pair.second.local_socket > max_sd) max_sd = pair.second.local_socket;
             }
 
-            timeval timeout; timeout.tv_sec = 5; timeout.tv_usec = 0;
+            timeval timeout; timeout.tv_sec = 1; timeout.tv_usec = 0;
             int activity = select(max_sd + 1, &read_fds, NULL, NULL, &timeout);
 
             auto now = std::chrono::steady_clock::now();
@@ -1083,25 +998,35 @@ void UDP_PortForwardingThread(Config base_config) {
                     sockaddr_in peer_addr; int peer_addr_len = sizeof(peer_addr);
                     int bytes = recvfrom(public_sock, buffer.data(), buffer.size(), 0, (sockaddr*)&peer_addr, &peer_addr_len);
                     if (bytes > 0) {
-                        char peer_ip_str[INET_ADDRSTRLEN];
-                        inet_ntop(AF_INET, &peer_addr.sin_addr, peer_ip_str, sizeof(peer_ip_str));
-                        std::string session_key = std::string(peer_ip_str) + ":" + std::to_string(ntohs(peer_addr.sin_port));
-
-                        if (sessions.count(session_key)) {
-                            sessions[session_key].last_activity = now;
-                            send(sessions[session_key].local_socket, buffer.data(), bytes, 0);
+                        std::string current_ip; int current_port;
+                        if (bytes > 20 && ParseStunResponse(buffer.data(), bytes, StunRfc::RFC5780, current_ip, current_port)) {
+                            if (current_ip != initial_public_ip || current_port != initial_public_port) {
+                                Print(YELLOW, "[UDP] 监控: 公网地址已变更！");
+                                Print(YELLOW, "       旧: ", initial_public_ip, ":", initial_public_port, " -> 新: ", current_ip, ":", current_port);
+                                g_udp_reconnect_flag = true;
+                                break;
+                            }
                         } else {
-                            if (config.udp_forward_host && !config.udp_forward_host->empty()) {
-                                SOCKET local_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-                                addrinfo* fwd_res = nullptr;
-                                getaddrinfo(config.udp_forward_host->c_str(), std::to_string(*config.udp_forward_port).c_str(), nullptr, &fwd_res);
-                                connect(local_sock, fwd_res->ai_addr, (int)fwd_res->ai_addrlen);
-                                freeaddrinfo(fwd_res);
-                                send(local_sock, buffer.data(), bytes, 0);
-                                Print(GREEN, "[UDP] 新会话 ", session_key, " ==> ", *config.udp_forward_host, ":", *config.udp_forward_port);
-                                sessions[session_key] = { local_sock, peer_addr, now };
+                            char peer_ip_str[INET_ADDRSTRLEN];
+                            inet_ntop(AF_INET, &peer_addr.sin_addr, peer_ip_str, sizeof(peer_ip_str));
+                            std::string session_key = std::string(peer_ip_str) + ":" + std::to_string(ntohs(peer_addr.sin_port));
+
+                            if (sessions.count(session_key)) {
+                                sessions[session_key].last_activity = now;
+                                send(sessions[session_key].local_socket, buffer.data(), bytes, 0);
                             } else {
-                                Print(CYAN, "[UDP] 仅打洞模式 来自 ", session_key, " 的数据包已丢弃");
+                                if (config.udp_forward_host && !config.udp_forward_host->empty()) {
+                                    SOCKET local_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+                                    addrinfo* fwd_res = nullptr;
+                                    getaddrinfo(config.udp_forward_host->c_str(), std::to_string(*config.udp_forward_port).c_str(), nullptr, &fwd_res);
+                                    connect(local_sock, fwd_res->ai_addr, (int)fwd_res->ai_addrlen);
+                                    freeaddrinfo(fwd_res);
+                                    send(local_sock, buffer.data(), bytes, 0);
+                                    Print(GREEN, "[UDP] 新会话 ", session_key, " ==> ", *config.udp_forward_host, ":", *config.udp_forward_port);
+                                    sessions[session_key] = { local_sock, peer_addr, now };
+                                } else {
+                                    Print(CYAN, "[UDP] 仅打洞模式 来自 ", session_key, " 的数据包已丢弃");
+                                }
                             }
                         }
                     }
@@ -1118,10 +1043,15 @@ void UDP_PortForwardingThread(Config base_config) {
                 }
             }
             
-            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_keepalive_time).count() > config.keep_alive_ms) {
-                char keepalive_req[20];
-                BuildStunRequest(keepalive_req, StunRfc::RFC5780);
-                sendto(public_sock, keepalive_req, sizeof(keepalive_req), 0, (sockaddr*)&successful_stun_server_addr, sizeof(successful_stun_server_addr));
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_monitor_time).count() >= config.monitor_interval_sec) {
+                Print(CYAN, "\n[UDP] 监控: 正在检查公网地址...");
+                char monitor_req[20]; BuildStunRequest(monitor_req, StunRfc::RFC5780);
+                sendto(public_sock, monitor_req, sizeof(monitor_req), 0, (sockaddr*)&last_successful_stun_server_addr, sizeof(last_successful_stun_server_addr));
+                last_monitor_time = now;
+                last_keepalive_time = now; // 监控检查也算一次保活
+            } else if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_keepalive_time).count() > config.keep_alive_ms) {
+                char keepalive_req[20]; BuildStunRequest(keepalive_req, StunRfc::RFC5780);
+                sendto(public_sock, keepalive_req, sizeof(keepalive_req), 0, (sockaddr*)&last_successful_stun_server_addr, sizeof(last_successful_stun_server_addr));
                 last_keepalive_time = now;
             }
 
