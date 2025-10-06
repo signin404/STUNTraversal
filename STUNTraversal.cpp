@@ -1078,7 +1078,7 @@ void UDP_PortForwardingThread(Config base_config) {
                                     connect(local_sock, fwd_res->ai_addr, (int)fwd_res->ai_addrlen);
                                     freeaddrinfo(fwd_res);
                                     send(local_sock, buffer.data(), bytes, 0);
-                                    Print(YELLOW, "[UDP] 开始转发 ", session_key, " <==> ", *config.udp_forward_host, ":", *config.udp_forward_port);
+                                    Print(MAGENTA, "[UDP] 开始转发 ", session_key, " <==> ", *config.udp_forward_host, ":", *config.udp_forward_port);
                                     sessions[session_key] = { local_sock, peer_addr, now };
                                 } else {
                                     Print(CYAN, "[UDP] 仅打洞模式: 来自 ", session_key, " 的数据包已丢弃");
@@ -1121,7 +1121,7 @@ void UDP_PortForwardingThread(Config base_config) {
             if (std::chrono::duration_cast<std::chrono::seconds>(now - last_cleanup_time).count() >= 10) {
                 for (auto it = sessions.begin(); it != sessions.end(); ) {
                     if (std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second.last_activity).count() > config.udp_session_timeout_ms) {
-                        Print(YELLOW, "[UDP] 会话 ", it->first, " 超时 已清理");
+                        Print(GRAY, "[UDP] 会话 ", it->first, " 超时 已清理");
                         closesocket(it->second.local_socket);
                         it = sessions.erase(it);
                     } else {
