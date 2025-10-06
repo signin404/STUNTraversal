@@ -1078,7 +1078,7 @@ void UDP_PortForwardingThread(Config base_config) {
                                     connect(local_sock, fwd_res->ai_addr, (int)fwd_res->ai_addrlen);
                                     freeaddrinfo(fwd_res);
                                     send(local_sock, buffer.data(), bytes, 0);
-                                    Print(MAGENTA, "[UDP] 开始转发 ", session_key, " <==> ", *config.udp_forward_host, ":", *config.udp_forward_port);
+                                    Print(GREEN, "[UDP] 开始转发 ", session_key, " <==> ", *config.udp_forward_host, ":", *config.udp_forward_port);
                                     sessions[session_key] = { local_sock, peer_addr, now };
                                 } else {
                                     Print(CYAN, "[UDP] 仅打洞模式: 来自 ", session_key, " 的数据包已丢弃");
