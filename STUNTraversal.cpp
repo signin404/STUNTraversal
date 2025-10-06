@@ -125,13 +125,14 @@ struct Config {
     std::optional<std::string> run_path;
     std::optional<std::string> run_cmd;
     std::optional<std::string> keep_alive_host;
+    std::optional<std::string> keep_alive_ip;
+    bool full_cone = false; // 【新】Full Cone 模式开关
     int monitor_interval_sec = 300;
     int keep_alive_retry = 3; // 【新】保活服务器连接重试次数
 };
 
 Config ReadIniConfig(const std::wstring& filePath) {
     Config config;
-    // ... (文件读取和编码转换部分保持不变) ...
     FILE* fp = _wfopen(filePath.c_str(), L"rb");
     if (!fp) return config;
 
@@ -198,8 +199,10 @@ Config ReadIniConfig(const std::wstring& filePath) {
                     else if (key_w == L"run") config.run_path = value;
                     else if (key_w == L"runcmd") config.run_cmd = value;
                     else if (key_w == L"keepalivehost") config.keep_alive_host = value;
+                    else if (key_w == L"keepaliveip") config.keep_alive_ip = value; // 【修复】添加读取 keep_alive_ip
                     else if (key_w == L"monitorintervalsec") config.monitor_interval_sec = std::stoi(value);
                     else if (key_w == L"keepaliveretry") config.keep_alive_retry = std::stoi(value);
+					else if (key_w == L"fullcone") config.full_cone = (std::stoi(value) == 1);
                 } catch (const std::exception&) { /* ignore bad values */ }
             }
         }
@@ -220,6 +223,32 @@ void BuildStunRequest(char* buffer, StunRfc rfc) {
     for (int i = 0; i < 3; ++i) {
         *(unsigned int*)(buffer + 8 + i * 4) = dis(gen);
     }
+}
+
+// 【新】构建一个简单的 DNS A 记录查询包
+void BuildDnsQuery(char* buffer, const std::string& domain) {
+    memset(buffer, 0, 512);
+    char* p = buffer;
+    *(unsigned short*)p = htons(rand()); p += 2;
+    *(unsigned short*)p = htons(0x0100); p += 2;
+    *(unsigned short*)p = htons(1); p += 2;
+    p += 6;
+    std::string temp_domain = domain;
+    size_t start = 0;
+    size_t end = temp_domain.find('.');
+    while (end != std::string::npos) {
+        *p++ = (char)(end - start);
+        memcpy(p, temp_domain.substr(start, end - start).c_str(), end - start);
+        p += (end - start);
+        start = end + 1;
+        end = temp_domain.find('.', start);
+    }
+    *p++ = (char)(temp_domain.length() - start);
+    memcpy(p, temp_domain.substr(start).c_str(), temp_domain.length() - start);
+    p += (temp_domain.length() - start);
+    *p++ = 0;
+    *(unsigned short*)p = htons(1); p += 2;
+    *(unsigned short*)p = htons(1); p += 2;
 }
 
 bool ParseStunResponse(char* response_buffer, int response_len, StunRfc rfc, std::string& out_ip, int& out_port) {
@@ -540,39 +569,35 @@ void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
     }
 }
 
-// 【优化】单线程代理循环 - 采用“先标记,后删除”策略处理连接关闭
-void TCP_SingleThreadProxyLoop(SOCKET listener_sock, const Config& config, int local_port) {
+// 【完整版】单线程代理循环 - 包含所有逻辑 未压缩
+void TCP_SingleThreadProxyLoop(SOCKET listener_sock, SOCKET initial_keep_alive_sock, const Config& config, int local_port, bool use_http_keepalive) {
     std::map<SOCKET, ConnectionPair> connections;
     char buffer[8192];
 
-    std::string ka_host = *config.keep_alive_host;
+    std::string ka_host = config.keep_alive_host.value_or("");
     std::string keep_alive_packet = "HEAD / HTTP/1.1\r\nHost: " + ka_host + "\r\nConnection: keep-alive\r\n\r\n";
     auto last_keepalive_time = std::chrono::steady_clock::now();
     
-    SOCKET keep_alive_sock = INVALID_SOCKET;
+    SOCKET keep_alive_sock = initial_keep_alive_sock;
 
     while (!g_tcp_reconnect_flag) {
 
-        if (keep_alive_sock == INVALID_SOCKET) {
-            Print(CYAN, "[TCP] 维持: 正在尝试连接保活服务器 ", *config.keep_alive_host, ":80...");
-            bool ka_reconnected = false;
+        // 【修复】在 FullCone 模式下 如果保活连接断开 则在此处执行“软”恢复
+        if (use_http_keepalive && keep_alive_sock == INVALID_SOCKET) {
+            Print(CYAN, "[TCP] 维持: 正在尝试重连保活服务器 ", *config.keep_alive_host, ":80...");
+            bool reconnected = false;
             for (int retry_count = 0; retry_count < config.keep_alive_retry; ++retry_count) {
                 SOCKET new_ka_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                 if (new_ka_sock == INVALID_SOCKET) continue;
-
-                BOOL reuse = TRUE;
-                setsockopt(new_ka_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+                BOOL reuse = TRUE; setsockopt(new_ka_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
                 sockaddr_in local_addr = { AF_INET, htons(local_port), {INADDR_ANY} };
-                if (bind(new_ka_sock, (sockaddr*)&local_addr, sizeof(local_addr)) != 0) {
-                    closesocket(new_ka_sock);
-                    continue;
-                }
-
+                if (bind(new_ka_sock, (sockaddr*)&local_addr, sizeof(local_addr)) != 0) { closesocket(new_ka_sock); continue; }
+                
                 addrinfo* ka_res = nullptr;
                 if (getaddrinfo(config.keep_alive_host->c_str(), "80", nullptr, &ka_res) == 0) {
                     if (connect(new_ka_sock, ka_res->ai_addr, (int)ka_res->ai_addrlen) == 0) {
                         keep_alive_sock = new_ka_sock;
-                        ka_reconnected = true;
+                        reconnected = true;
                         freeaddrinfo(ka_res);
                         break;
                     }
@@ -585,19 +610,20 @@ void TCP_SingleThreadProxyLoop(SOCKET listener_sock, const Config& config, int l
                     std::this_thread::sleep_for(std::chrono::seconds(3));
                 }
             }
-
-            if (!ka_reconnected) {
+            if (!reconnected) {
                 Print(RED, "[TCP] 维持: 所有重连尝试均失败 触发完整重连...");
                 g_tcp_reconnect_flag = true;
                 continue;
             }
-            Print(LIGHT_GREEN, "[TCP] 维持: 成功连接保活服务器");
+            Print(LIGHT_GREEN, "[TCP] 维持: 成功重连保活服务器");
         }
 
         fd_set read_fds;
         FD_ZERO(&read_fds);
         FD_SET(listener_sock, &read_fds);
-        FD_SET(keep_alive_sock, &read_fds);
+        if (keep_alive_sock != INVALID_SOCKET) {
+            FD_SET(keep_alive_sock, &read_fds);
+        }
         SOCKET max_sd = max(listener_sock, keep_alive_sock);
 
         for (const auto& pair : connections) {
@@ -612,7 +638,7 @@ void TCP_SingleThreadProxyLoop(SOCKET listener_sock, const Config& config, int l
         timeout.tv_usec = 0;
         int activity = select(max_sd + 1, &read_fds, NULL, NULL, &timeout);
 
-        if (activity < 0) { continue; }
+        if (activity < 0) { g_tcp_reconnect_flag = true; continue; }
 
         if (FD_ISSET(listener_sock, &read_fds)) {
             sockaddr_in client_addr;
@@ -638,13 +664,13 @@ void TCP_SingleThreadProxyLoop(SOCKET listener_sock, const Config& config, int l
                     }
                     freeaddrinfo(fwd_res);
                 } else {
-                    Print(CYAN, "[TCP] 仅打洞模式 来自 ", client_ip_str, " 的连接已关闭");
+                    Print(CYAN, "[TCP] 仅打洞模式: 来自 ", client_ip_str, " 的连接已关闭");
                     closesocket(new_client_socket);
                 }
             }
         }
 
-        if (FD_ISSET(keep_alive_sock, &read_fds)) {
+        if (keep_alive_sock != INVALID_SOCKET && FD_ISSET(keep_alive_sock, &read_fds)) {
             int bytes = recv(keep_alive_sock, buffer, sizeof(buffer), 0);
             if (bytes <= 0) {
                 Print(RED, "[TCP] 维持: 保活服务器连接已断开 自动重连...");
@@ -654,38 +680,46 @@ void TCP_SingleThreadProxyLoop(SOCKET listener_sock, const Config& config, int l
             }
         }
 
-        // 【新】使用“先标记 后删除”策略
         std::vector<SOCKET> sockets_to_close;
-        for (const auto& pair : connections) {
-            SOCKET source_sock = pair.first;
-            if (FD_ISSET(source_sock, &read_fds)) {
-                SOCKET target_sock = (source_sock == pair.second.client_socket) ? pair.second.local_socket : pair.second.client_socket;
-                int bytes = recv(source_sock, buffer, sizeof(buffer), 0);
+        for (auto it = connections.begin(); it != connections.end(); ++it) {
+            if (it->first != it->second.client_socket) continue;
+
+            SOCKET client_sock = it->second.client_socket;
+            SOCKET local_sock = it->second.local_socket;
+
+            if (FD_ISSET(client_sock, &read_fds)) {
+                int bytes = recv(client_sock, buffer, sizeof(buffer), 0);
                 if (bytes > 0) {
-                    if (send(target_sock, buffer, bytes, 0) <= 0) {
-                        sockets_to_close.push_back(source_sock);
-                    }
+                    if (send(local_sock, buffer, bytes, 0) <= 0) sockets_to_close.push_back(it->first);
                 } else {
-                    sockets_to_close.push_back(source_sock);
+                    sockets_to_close.push_back(it->first);
+                }
+            }
+            else if (FD_ISSET(local_sock, &read_fds)) {
+                 int bytes = recv(local_sock, buffer, sizeof(buffer), 0);
+                if (bytes > 0) {
+                    if (send(client_sock, buffer, bytes, 0) <= 0) sockets_to_close.push_back(it->first);
+                } else {
+                    sockets_to_close.push_back(it->first);
                 }
             }
         }
 
         if (!sockets_to_close.empty()) {
             // Print(YELLOW, "[TCP] 连接关闭 清理通道");
-            for (SOCKET sock : sockets_to_close) {
-                if (connections.count(sock)) {
-                    const auto& pair = connections.at(sock);
-                    closesocket(pair.client_socket);
-                    closesocket(pair.local_socket);
-                    connections.erase(pair.client_socket);
-                    connections.erase(pair.local_socket);
+            for (SOCKET sock_key : sockets_to_close) {
+                if (connections.count(sock_key)) {
+                    const auto& pair_to_close = connections.at(sock_key);
+                    closesocket(pair_to_close.client_socket);
+                    closesocket(pair_to_close.local_socket);
+                    connections.erase(pair_to_close.client_socket);
+                    connections.erase(pair_to_close.local_socket);
                 }
             }
         }
 
         auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_keepalive_time).count() > config.keep_alive_ms) {
+        if (use_http_keepalive && keep_alive_sock != INVALID_SOCKET && std::chrono::duration_cast<std::chrono::milliseconds>(now - last_keepalive_time).count() > config.keep_alive_ms) {
             if (send(keep_alive_sock, keep_alive_packet.c_str(), keep_alive_packet.length(), 0) == SOCKET_ERROR) {
                 Print(RED, "[TCP] 维持: 发送保活包失败 自动重连...");
                 closesocket(keep_alive_sock);
@@ -705,130 +739,137 @@ void TCP_SingleThreadProxyLoop(SOCKET listener_sock, const Config& config, int l
     }
 }
 
-// 【完整版】TCP 主线程 - 负责找到初始状态并传递给监控线程
+// 【完整版】TCP 主线程 - 实现 FullCone 模式切换
 void TCP_PortForwardingThread(Config base_config) {
     winrt::init_apartment();
-
-    if (!base_config.keep_alive_host.has_value() || base_config.keep_alive_host->empty()) {
-        Print(RED, "[TCP] 错误: 未在配置文件中设置 'KeepAliveHost'TCP 线程无法启动");
-        winrt::uninit_apartment();
-        return;
-    }
 
     do {
         g_tcp_reconnect_flag = false;
         g_tcp_ready = false;
         g_run_executed_this_cycle = false;
         Config config = base_config;
-        SOCKET listener_sock = INVALID_SOCKET, stun_sock = INVALID_SOCKET;
+        SOCKET listener_sock = INVALID_SOCKET, keep_alive_sock = INVALID_SOCKET;
         std::string public_ip; int public_port;
         bool stun_success = false;
-
-        // 【新】用于记录成功状态的变量
+        
         int last_successful_server_index = -1;
         std::map<std::string, StunRfc> protocol_map;
 
         Print(WHITE, "\n--- [TCP] 开始新一轮端口穿透尝试 ---");
 
-        // 阶段一: 使用 STUN 服务器发现端口
+        SOCKET successful_stun_sock = INVALID_SOCKET;
         for (int i = 0; i < config.stun_servers.size(); ++i) {
             if (stun_success) break;
             const auto& server_str = config.stun_servers[i];
-            
-            size_t colon_pos = server_str.find(':');
-            if (colon_pos == std::string::npos) continue;
-            std::string host = server_str.substr(0, colon_pos);
-            int port = std::stoi(server_str.substr(colon_pos + 1));
+            size_t colon_pos = server_str.find(':'); if (colon_pos == std::string::npos) continue;
+            std::string host = server_str.substr(0, colon_pos); int port = std::stoi(server_str.substr(colon_pos + 1));
 
-            // 优先尝试 RFC5780
-            for (int retry = 0; retry < config.stun_retry; ++retry) {
-                Print(CYAN, "[TCP] 发现: 尝试 ", host, ":", port, " (RFC5780, 第 ", retry + 1, " 次)...");
-                stun_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP); if(stun_sock == INVALID_SOCKET) continue;
+            auto attempt_stun = [&](StunRfc rfc) {
+                SOCKET stun_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                if(stun_sock == INVALID_SOCKET) return;
                 BOOL reuse = TRUE; setsockopt(stun_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
                 sockaddr_in local_addr = { AF_INET, htons(*config.tcp_listen_port), {INADDR_ANY} };
-                if (bind(stun_sock, (sockaddr*)&local_addr, sizeof(local_addr)) != 0) { closesocket(stun_sock); continue; }
+                if (bind(stun_sock, (sockaddr*)&local_addr, sizeof(local_addr)) != 0) { closesocket(stun_sock); return; }
                 
                 addrinfo* stun_res = nullptr;
                 if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), nullptr, &stun_res) == 0) {
                     if (connect(stun_sock, stun_res->ai_addr, (int)stun_res->ai_addrlen) == 0) {
-                        char req[20]; BuildStunRequest(req, StunRfc::RFC5780);
+                        char req[20]; BuildStunRequest(req, rfc);
                         if (send(stun_sock, req, sizeof(req), 0) != SOCKET_ERROR) {
                             char response_buffer[512];
                             int bytes = recv(stun_sock, response_buffer, sizeof(response_buffer), 0);
-                            if (bytes > 20 && ParseStunResponse(response_buffer, bytes, StunRfc::RFC5780, public_ip, public_port)) {
+                            if (bytes > 20 && ParseStunResponse(response_buffer, bytes, rfc, public_ip, public_port)) {
                                 stun_success = true;
                                 last_successful_server_index = i;
-                                protocol_map[server_str] = StunRfc::RFC5780;
+                                protocol_map[server_str] = rfc;
+                                successful_stun_sock = stun_sock;
                             }
                         }
                     }
                     freeaddrinfo(stun_res);
                 }
-                closesocket(stun_sock);
-                if (stun_success) break;
+                if (!stun_success) closesocket(stun_sock);
+            };
+
+            for (int retry = 0; retry < config.stun_retry && !stun_success; ++retry) {
+                Print(CYAN, "[TCP] 发现: 尝试 ", host, ":", port, " (RFC5780, 第 ", retry + 1, " 次)...");
+                attempt_stun(StunRfc::RFC5780);
+                if(stun_success) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(config.stun_retry_delay_ms));
             }
-            if (stun_success) break;
-
-            // 如果 RFC5780 失败 再尝试 RFC3489
-            for (int retry = 0; retry < config.stun_retry; ++retry) {
-                 Print(CYAN, "[TCP] 发现: 尝试 ", host, ":", port, " (RFC3489, 第 ", retry + 1, " 次)...");
-                stun_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP); if(stun_sock == INVALID_SOCKET) continue;
-                BOOL reuse = TRUE; setsockopt(stun_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
-                sockaddr_in local_addr = { AF_INET, htons(*config.tcp_listen_port), {INADDR_ANY} };
-                if (bind(stun_sock, (sockaddr*)&local_addr, sizeof(local_addr)) != 0) { closesocket(stun_sock); continue; }
-
-                addrinfo* stun_res = nullptr;
-                if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), nullptr, &stun_res) == 0) {
-                    if (connect(stun_sock, stun_res->ai_addr, (int)stun_res->ai_addrlen) == 0) {
-                        char req[20]; BuildStunRequest(req, StunRfc::RFC3489);
-                        if (send(stun_sock, req, sizeof(req), 0) != SOCKET_ERROR) {
-                            char response_buffer[512];
-                            int bytes = recv(stun_sock, response_buffer, sizeof(response_buffer), 0);
-                            if (bytes > 20 && ParseStunResponse(response_buffer, bytes, StunRfc::RFC3489, public_ip, public_port)) {
-                                stun_success = true;
-                                last_successful_server_index = i;
-                                protocol_map[server_str] = StunRfc::RFC3489;
-                            }
-                        }
-                    }
-                    freeaddrinfo(stun_res);
-                }
-                closesocket(stun_sock);
-                if (stun_success) break;
+            if(stun_success) break;
+            for (int retry = 0; retry < config.stun_retry && !stun_success; ++retry) {
+                Print(CYAN, "[TCP] 发现: 尝试 ", host, ":", port, " (RFC3489, 第 ", retry + 1, " 次)...");
+                attempt_stun(StunRfc::RFC3489);
+                if(stun_success) break;
                 std::this_thread::sleep_for(std::chrono::milliseconds(config.stun_retry_delay_ms));
             }
         }
 
         if (!stun_success) {
             Print(RED, "[TCP] 发现: 所有STUN服务器均尝试失败");
-            if (config.auto_retry) {
-                Print(YELLOW, "[TCP] 等待 ", config.retry_interval_ms / 1000, " 秒后重试...");
-                std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms));
-            }
+            if (config.auto_retry) { Print(YELLOW, "[TCP] 等待 ", config.retry_interval_ms / 1000, " 秒后重试..."); std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms)); }
             continue;
         }
-
         Print(LIGHT_GREEN, "[TCP] 发现: 成功获取公网端口 ", public_ip, ":", public_port);
-        g_public_ip = public_ip;
-        g_tcp_port_str = std::to_string(public_port);
-        
-        if (config.tcp_forward_port == 0) {
-            config.tcp_forward_port = public_port;
-            Print(CYAN, "[TCP] 动态转发端口已设置为公网端口: ", *config.tcp_forward_port);
+        g_public_ip = public_ip; g_tcp_port_str = std::to_string(public_port);
+        if (config.tcp_forward_port == 0) { config.tcp_forward_port = public_port; Print(CYAN, "[TCP] 动态转发端口已设置为公网端口: ", *config.tcp_forward_port); } else { Print(CYAN, "[TCP] 转发端口已设置为: ", *config.tcp_forward_port); }
+
+        bool use_http_keepalive = false;
+        if (config.full_cone) {
+            if (!config.keep_alive_host.has_value() || config.keep_alive_host->empty()) {
+                Print(RED, "[TCP] Full Cone 模式错误: 未设置 'KeepAliveHost'");
+                if (config.auto_retry) std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms));
+                continue;
+            }
+            Print(CYAN, "[TCP] Full Cone 模式: 使用 ", *config.keep_alive_host, " 进行保活");
+            closesocket(successful_stun_sock);
+            use_http_keepalive = true;
+
+            // 【修复】在 FullCone 模式下 主线程负责建立初始的保活连接
+            for (int retry_count = 0; retry_count < config.keep_alive_retry; ++retry_count) {
+                keep_alive_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                BOOL reuse = TRUE; setsockopt(keep_alive_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+                sockaddr_in local_addr = { AF_INET, htons(*config.tcp_listen_port), {INADDR_ANY} };
+                if (bind(keep_alive_sock, (sockaddr*)&local_addr, sizeof(local_addr)) != 0) { closesocket(keep_alive_sock); keep_alive_sock = INVALID_SOCKET; continue; }
+                
+                addrinfo* ka_res = nullptr;
+                if (getaddrinfo(config.keep_alive_host->c_str(), "80", nullptr, &ka_res) == 0) {
+                    if (connect(keep_alive_sock, ka_res->ai_addr, (int)ka_res->ai_addrlen) == 0) {
+                        freeaddrinfo(ka_res);
+                        break; // 连接成功
+                    }
+                    freeaddrinfo(ka_res);
+                }
+                closesocket(keep_alive_sock);
+                keep_alive_sock = INVALID_SOCKET;
+                if (retry_count < config.keep_alive_retry - 1) {
+                    Print(YELLOW, "[TCP] 维持: 连接保活服务器失败 3秒后重试 (", retry_count + 1, "/", config.keep_alive_retry, ")...");
+                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                }
+            }
+            if (keep_alive_sock == INVALID_SOCKET) {
+                Print(RED, "[TCP] 维持: 所有重连尝试均失败 触发完整重连...");
+                if (config.auto_retry) std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms));
+                continue;
+            }
+
         } else {
-            Print(CYAN, "[TCP] 转发端口已设置为: ", *config.tcp_forward_port);
+            Print(CYAN, "[TCP] 标准模式: 使用 STUN 服务器进行保活");
+            keep_alive_sock = successful_stun_sock;
+            use_http_keepalive = false;
+            tcp_keepalive ka; ka.onoff = (u_long)1; ka.keepalivetime = config.keep_alive_ms; ka.keepaliveinterval = 1000;
+            DWORD bytes_returned;
+            WSAIoctl(keep_alive_sock, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), NULL, 0, &bytes_returned, NULL, NULL);
         }
 
         listener_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        BOOL reuse = TRUE;
-        setsockopt(listener_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+        BOOL reuse = TRUE; setsockopt(listener_sock, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
         sockaddr_in local_addr = { AF_INET, htons(*config.tcp_listen_port), {INADDR_ANY} };
-
-        if (bind(listener_sock, (sockaddr*)&local_addr, sizeof(local_addr)) != 0 ||
-            listen(listener_sock, SOMAXCONN) != 0) {
+        if (bind(listener_sock, (sockaddr*)&local_addr, sizeof(local_addr)) != 0 || listen(listener_sock, SOMAXCONN) != 0) {
             Print(RED, "[TCP] 维持: 绑定或监听本地端口失败 重启流程...");
             if(listener_sock != INVALID_SOCKET) closesocket(listener_sock);
+            if(keep_alive_sock != INVALID_SOCKET) closesocket(keep_alive_sock);
             if (config.auto_retry) std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms));
             continue;
         }
@@ -836,19 +877,16 @@ void TCP_PortForwardingThread(Config base_config) {
         Print(LIGHT_GREEN, "[TCP] 维持: 本地端口监听已就绪");
         g_tcp_ready = true;
         
-        while (!CheckAndExecuteRun(base_config, base_config.tcp_listen_port.has_value(), base_config.udp_listen_port.has_value())) {
-            if (g_tcp_reconnect_flag) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
+        while (!CheckAndExecuteRun(base_config, true, base_config.udp_listen_port.has_value())) { if (g_tcp_reconnect_flag) break; std::this_thread::sleep_for(std::chrono::milliseconds(100)); }
         
         std::thread(TCP_StunCheckThread, public_ip, public_port, config, *config.tcp_listen_port, last_successful_server_index, protocol_map).detach();
 
-        TCP_SingleThreadProxyLoop(listener_sock, config, *config.tcp_listen_port);
+        TCP_SingleThreadProxyLoop(listener_sock, keep_alive_sock, config, *config.tcp_listen_port, use_http_keepalive);
 
-        closesocket(listener_sock);
-        if (g_tcp_reconnect_flag) {
-            Print(YELLOW, "[TCP] 检测到公网地址变更 重启完整穿透流程...");
-        }
+        if (listener_sock != INVALID_SOCKET) closesocket(listener_sock);
+        if (keep_alive_sock != INVALID_SOCKET) closesocket(keep_alive_sock);
+        if (g_tcp_reconnect_flag) { Print(YELLOW, "[TCP] 检测到公网地址变更 重启完整穿透流程..."); }
+
     } while (base_config.auto_retry);
 
     winrt::uninit_apartment();
@@ -861,7 +899,7 @@ struct UDPSession {
     std::chrono::steady_clock::time_point last_activity;
 };
 
-// 【完整最终版】UDP 主线程 - 集成监控功能 移除独立的监控线程
+// 【完整版】UDP 主线程 - 实现 FullCone 模式切换
 void UDP_PortForwardingThread(Config base_config) {
     winrt::init_apartment();
 
@@ -878,8 +916,28 @@ void UDP_PortForwardingThread(Config base_config) {
         int last_successful_server_index = -1;
         std::map<std::string, StunRfc> protocol_map;
         sockaddr_in last_successful_stun_server_addr;
+        sockaddr_in keep_alive_addr;
 
         Print(WHITE, "\n--- [UDP] 开始新一轮端口穿透尝试 ---");
+
+        if (config.full_cone) {
+            if (!config.keep_alive_ip.has_value() || config.keep_alive_ip->empty()) {
+                Print(RED, "[UDP] Full Cone 模式错误: 未设置 'KeepAliveIP'");
+                if (config.auto_retry) std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms));
+                continue;
+            }
+            addrinfo* ka_res = nullptr;
+            if (getaddrinfo(config.keep_alive_ip->c_str(), "53", nullptr, &ka_res) != 0) {
+                Print(RED, "[UDP] 错误: 无法解析 KeepAliveIP '", *config.keep_alive_ip, "'");
+                if (config.auto_retry) std::this_thread::sleep_for(std::chrono::milliseconds(config.retry_interval_ms));
+                continue;
+            }
+            memcpy(&keep_alive_addr, ka_res->ai_addr, ka_res->ai_addrlen);
+            freeaddrinfo(ka_res);
+            Print(CYAN, "[UDP] Full Cone 模式: 使用 ", *config.keep_alive_ip, " 进行保活");
+        } else {
+            Print(CYAN, "[UDP] 标准模式: 使用 STUN 服务器进行保活");
+        }
 
         public_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if(public_sock == INVALID_SOCKET) {
@@ -936,12 +994,11 @@ void UDP_PortForwardingThread(Config base_config) {
             attempt_stun(StunRfc::RFC3489);
         }
         
-        // 恢复socket为非阻塞/无超时模式 以配合select
         int timeout_zero = 0;
         setsockopt(public_sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_zero, sizeof(timeout_zero));
 
         if (!stun_success) {
-            Print(RED, "[UDP] 所有STUN服务器均尝试失败");
+            Print(RED, "[UDP] 监控: 所有 STUN 服务器检查均失败");
             closesocket(public_sock);
             if (config.auto_retry) {
                 Print(YELLOW, "[UDP] 等待 ", config.retry_interval_ms / 1000, " 秒后重试...");
@@ -950,7 +1007,6 @@ void UDP_PortForwardingThread(Config base_config) {
             continue;
         }
 
-        // 记录初始公网地址 用于后续比较
         std::string initial_public_ip = public_ip;
         int initial_public_port = public_port;
 
@@ -967,7 +1023,7 @@ void UDP_PortForwardingThread(Config base_config) {
         Print(LIGHT_GREEN, "[UDP] 发现: 成功获取公网端口 ", public_ip, ":", public_port);
         
         g_udp_ready = true;
-        while (!CheckAndExecuteRun(base_config, base_config.tcp_listen_port.has_value(), base_config.udp_listen_port.has_value())) {
+        while (!CheckAndExecuteRun(base_config, base_config.tcp_listen_port.has_value(), true)) {
             if (g_tcp_reconnect_flag || g_udp_reconnect_flag) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
@@ -1022,10 +1078,10 @@ void UDP_PortForwardingThread(Config base_config) {
                                     connect(local_sock, fwd_res->ai_addr, (int)fwd_res->ai_addrlen);
                                     freeaddrinfo(fwd_res);
                                     send(local_sock, buffer.data(), bytes, 0);
-                                    Print(GREEN, "[UDP] 新会话 ", session_key, " ==> ", *config.udp_forward_host, ":", *config.udp_forward_port);
+                                    Print(YELLOW, "[UDP] 开始转发 ", session_key, " <==> ", *config.udp_forward_host, ":", *config.udp_forward_port);
                                     sessions[session_key] = { local_sock, peer_addr, now };
                                 } else {
-                                    Print(CYAN, "[UDP] 仅打洞模式 来自 ", session_key, " 的数据包已丢弃");
+                                    Print(CYAN, "[UDP] 仅打洞模式: 来自 ", session_key, " 的数据包已丢弃");
                                 }
                             }
                         }
@@ -1048,10 +1104,17 @@ void UDP_PortForwardingThread(Config base_config) {
                 char monitor_req[20]; BuildStunRequest(monitor_req, StunRfc::RFC5780);
                 sendto(public_sock, monitor_req, sizeof(monitor_req), 0, (sockaddr*)&last_successful_stun_server_addr, sizeof(last_successful_stun_server_addr));
                 last_monitor_time = now;
-                last_keepalive_time = now; // 监控检查也算一次保活
+                last_keepalive_time = now;
             } else if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_keepalive_time).count() > config.keep_alive_ms) {
-                char keepalive_req[20]; BuildStunRequest(keepalive_req, StunRfc::RFC5780);
-                sendto(public_sock, keepalive_req, sizeof(keepalive_req), 0, (sockaddr*)&last_successful_stun_server_addr, sizeof(last_successful_stun_server_addr));
+                if (config.full_cone) {
+                    char dns_query[512];
+                    BuildDnsQuery(dns_query, "www.baidu.com");
+                    sendto(public_sock, dns_query, 32, 0, (sockaddr*)&keep_alive_addr, sizeof(keep_alive_addr));
+                } else {
+                    char keepalive_req[20];
+                    BuildStunRequest(keepalive_req, StunRfc::RFC5780);
+                    sendto(public_sock, keepalive_req, sizeof(keepalive_req), 0, (sockaddr*)&last_successful_stun_server_addr, sizeof(last_successful_stun_server_addr));
+                }
                 last_keepalive_time = now;
             }
 
