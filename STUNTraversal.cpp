@@ -481,6 +481,11 @@ void TCP_StunCheckThread(std::string initial_ip, int initial_port, const Config&
     auto protocol_map = initial_protocol_map;
 
     while (!g_tcp_reconnect_flag) {
+        // 【新】如果主线程已开始重连，则此旧的监控线程应立即退出
+        if (!g_tcp_ready) {
+            Print(CYAN, "[TCP] 监控: 检测到主线程已重连 旧的监控线程退出");
+            return;
+        }
         std::this_thread::sleep_for(std::chrono::seconds(config.monitor_interval_sec));
         if (g_tcp_reconnect_flag) break;
 
