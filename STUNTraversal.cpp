@@ -652,7 +652,11 @@ void TCP_SingleThreadProxyLoop(SOCKET listener_sock, SOCKET initial_keep_alive_s
             int client_addr_len = sizeof(client_addr);
             SOCKET new_client_socket = accept(listener_sock, (sockaddr*)&client_addr, &client_addr_len);
 
-            if (config.tcp_forward_host && !config.tcp_forward_host->empty()) {
+            if (new_client_socket != INVALID_SOCKET) {
+                char client_ip_str[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &client_addr.sin_addr, client_ip_str, sizeof(client_ip_str));
+                
+                if (config.tcp_forward_host && !config.tcp_forward_host->empty()) {
                     SOCKET new_local_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                     addrinfo* fwd_res = nullptr;
                     getaddrinfo(config.tcp_forward_host->c_str(), std::to_string(*config.tcp_forward_port).c_str(), nullptr, &fwd_res);
