@@ -129,6 +129,7 @@ struct Config {
     bool full_cone = false; // 【新】Full Cone 模式开关
     int monitor_interval_sec = 300;
     int keep_alive_retry = 3; // 【新】保活服务器连接重试次数
+    bool use_friendly_address = true; // 【新】友好地址绑定开关，默认开启
 };
 
 Config ReadIniConfig(const std::wstring& filePath) {
@@ -203,6 +204,7 @@ Config ReadIniConfig(const std::wstring& filePath) {
                     else if (key_w == L"monitorintervalsec") config.monitor_interval_sec = std::stoi(value);
                     else if (key_w == L"keepaliveretry") config.keep_alive_retry = std::stoi(value);
 					else if (key_w == L"fullcone") config.full_cone = (std::stoi(value) == 1);
+					else if (key_w == L"usefriendlyaddress") config.use_friendly_address = (std::stoi(value) == 1);
                 } catch (const std::exception&) { /* ignore bad values */ }
             }
         }
@@ -650,15 +652,64 @@ void TCP_SingleThreadProxyLoop(SOCKET listener_sock, SOCKET initial_keep_alive_s
             int client_addr_len = sizeof(client_addr);
             SOCKET new_client_socket = accept(listener_sock, (sockaddr*)&client_addr, &client_addr_len);
 
-            if (new_client_socket != INVALID_SOCKET) {
-                char client_ip_str[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &client_addr.sin_addr, client_ip_str, sizeof(client_ip_str));
-                
-                if (config.tcp_forward_host && !config.tcp_forward_host->empty()) {
+            if (config.tcp_forward_host && !config.tcp_forward_host->empty()) {
                     SOCKET new_local_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                     addrinfo* fwd_res = nullptr;
                     getaddrinfo(config.tcp_forward_host->c_str(), std::to_string(*config.tcp_forward_port).c_str(), nullptr, &fwd_res);
-                    if (connect(new_local_socket, fwd_res->ai_addr, (int)fwd_res->ai_addrlen) == 0) {
+                    
+                    bool connected = false;
+                    bool is_loopback = false;
+                    
+                    // 检查目标地址是否为环回地址 (127.x.x.x)
+                    if (fwd_res && fwd_res->ai_family == AF_INET) {
+                        sockaddr_in* addr = (sockaddr_in*)fwd_res->ai_addr;
+                        if ((ntohl(addr->sin_addr.s_addr) & 0xFF000000) == 0x7F000000) {
+                            is_loopback = true;
+                        }
+                    }
+
+                    // --- 友好地址绑定逻辑 (Friendly Address Binding) ---
+                    if (is_loopback && config.use_friendly_address) {
+                        sockaddr_in friendly_addr = {};
+                        friendly_addr.sin_family = AF_INET;
+                        // 构造 127.x.y.z (x.y.z 来自客户端真实 IP)
+                        friendly_addr.sin_addr.s_addr = htonl((ntohl(client_addr.sin_addr.s_addr) & 0x00FFFFFF) | 0x7F000000);
+                        friendly_addr.sin_port = client_addr.sin_port; // 尝试使用与客户端相同的端口
+
+                        // 尝试 1: 绑定到友好地址和原始端口
+                        if (bind(new_local_socket, (sockaddr*)&friendly_addr, sizeof(friendly_addr)) == 0) {
+                            if (connect(new_local_socket, fwd_res->ai_addr, (int)fwd_res->ai_addrlen) == 0) {
+                                connected = true;
+                            }
+                        }
+
+                        // 尝试 2: 如果尝试 1 失败，绑定到友好地址和随机端口
+                        if (!connected) {
+                            closesocket(new_local_socket);
+                            new_local_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                            friendly_addr.sin_port = 0; // 随机端口
+                            if (bind(new_local_socket, (sockaddr*)&friendly_addr, sizeof(friendly_addr)) == 0) {
+                                if (connect(new_local_socket, fwd_res->ai_addr, (int)fwd_res->ai_addrlen) == 0) {
+                                    connected = true;
+                                }
+                            }
+                        }
+                    }
+
+                    // 默认回退: 如果友好地址绑定失败或未启用，使用默认方式连接
+                    if (!connected) {
+                        if (is_loopback && config.use_friendly_address) {
+                            // 重置 socket 状态
+                            closesocket(new_local_socket);
+                            new_local_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                        }
+                        if (connect(new_local_socket, fwd_res->ai_addr, (int)fwd_res->ai_addrlen) == 0) {
+                            connected = true;
+                        }
+                    }
+                    // --- 友好地址绑定逻辑结束 ---
+
+                    if (connected) {
                         Print(YELLOW, "[TCP] 开始转发 ", client_ip_str, " <==> ", *config.tcp_forward_host, ":", *config.tcp_forward_port);
                         connections[new_client_socket] = { new_client_socket, new_local_socket };
                         connections[new_local_socket] = { new_client_socket, new_local_socket };
